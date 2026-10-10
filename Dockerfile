@@ -25,13 +25,14 @@ COPY --from=build /app ./
 ENV ParquetExplorer__Query__ExtensionDirectory=/app/duckdb-extensions
 RUN dotnet ParquetExplorer.dll install-extensions /app/duckdb-extensions
 ENV ASPNETCORE_URLS=http://+:8080 \
-    ParquetExplorer__DataProtectionKeysPath=/keys \
+    ParquetExplorer__StateDirectory=/state \
+    ParquetExplorer__SourceManagement__AllowedLocalRoots__0=/data \
     ParquetExplorer__Query__TempDirectory=/tmp/parquet-explorer \
     ParquetExplorer__DataSources__0__Name=data \
     ParquetExplorer__DataSources__0__Type=Local \
     ParquetExplorer__DataSources__0__Path=/data
-RUN mkdir -p /data /keys && chown -R app:app /data /keys /app/duckdb-extensions
+RUN mkdir -p /data /state && chown -R app:app /data /state /app/duckdb-extensions
 USER app
 EXPOSE 8080
-VOLUME ["/keys"]
+VOLUME ["/state"]
 ENTRYPOINT ["dotnet", "ParquetExplorer.dll"]

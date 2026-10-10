@@ -10,14 +10,15 @@ using ParquetExplorer.Options;
 
 namespace ParquetExplorer.Services;
 
-public sealed class QueryService(DuckDbEngine engine, QueryHistoryService history, IOptions<ExplorerOptions> options, ILogger<QueryService> logger)
+public sealed class QueryService(DuckDbEngine engine, QueryHistoryService history, UserStore users, IOptions<ExplorerOptions> options, ILogger<QueryService> logger)
 {
     private readonly QueryOptions _opts = options.Value.Query;
 
     public int DefaultRowLimit => _opts.DefaultRowLimit;
     public int MaxRowLimit => _opts.MaxRowLimit;
 
-    public static bool IsAdmin(ClaimsPrincipal user) => user.IsInRole("Admin");
+    /// <summary>Checked against the user store, so role changes and disabled accounts apply immediately.</summary>
+    public bool IsAdmin(ClaimsPrincipal user) => users.IsAdmin(user.Identity?.Name);
 
     /// <summary>Runs a script. Each statement producing rows yields a result set (capped at <paramref name="rowLimit"/> rows).</summary>
     public Task<QueryExecution> ExecuteAsync(string sql, int rowLimit, ClaimsPrincipal user,
@@ -35,6 +36,8 @@ public sealed class QueryService(DuckDbEngine engine, QueryHistoryService histor
 
         try
         {
+            if (!users.IsActive(userName))
+                throw new UnauthorizedAccessException("Your account is disabled or no longer exists. Sign in again.");
             if (!IsAdmin(user) && SqlGuard.CheckReadOnly(sql) is { } reason)
                 throw new UnauthorizedAccessException(reason);
 

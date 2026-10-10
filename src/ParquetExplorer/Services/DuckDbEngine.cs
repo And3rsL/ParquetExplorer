@@ -5,109 +5,93 @@ using ParquetExplorer.Options;
 namespace ParquetExplorer.Services;
 
 /// <summary>
-/// Owns the single in-process DuckDB database. Every query runs on a lightweight duplicated
+/// One sandboxed in-memory DuckDB database. Every query runs on a lightweight duplicated
 /// connection, so queries execute in parallel while sharing catalog (views), caches and buffer pool.
 /// </summary>
 /// <remarks>
-/// After start-up the engine is sandboxed: file system access is limited to the configured data
-/// sources (plus the temp folder) and the configuration is locked, so users cannot change settings,
-/// read arbitrary files or leak the S3 credentials.
+/// Once built, file system access is limited to the given data sources (plus the temp folder) and
+/// the configuration is locked, so users cannot change settings, read arbitrary files or leak the
+/// S3 credentials. Changing the set of sources therefore means building a new instance.
 /// </remarks>
-public sealed class DuckDbEngine : IDisposable
+public sealed class EngineInstance : IDisposable
 {
     private readonly DuckDBConnection _root;
-    private readonly ILogger<DuckDbEngine> _logger;
-    private readonly HashSet<string> _failedSources = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _sourceErrors = new(StringComparer.OrdinalIgnoreCase);
 
-    public string ExportDirectory { get; }
     public string Version { get; }
 
-    public DuckDbEngine(IOptions<ExplorerOptions> options, ILogger<DuckDbEngine> logger)
+    internal EngineInstance(IReadOnlyList<DataSourceOptions> sources, QueryOptions q, string tempDir, ILogger logger)
     {
-        _logger = logger;
-        var opts = options.Value;
-        var q = opts.Query;
-
-        var tempDir = Path.GetFullPath(string.IsNullOrWhiteSpace(q.TempDirectory)
-            ? Path.Combine(Path.GetTempPath(), "parquet-explorer")
-            : q.TempDirectory);
-        ExportDirectory = Path.Combine(tempDir, "exports");
-        Directory.CreateDirectory(ExportDirectory);
-
         _root = new DuckDBConnection("Data Source=:memory:");
         _root.Open();
-
-        Exec($"SET temp_directory = {SqlText.Literal(Path.Combine(tempDir, "spill"))}");
-        if (q.Threads > 0) Exec($"SET threads = {q.Threads}");
-        if (!string.IsNullOrWhiteSpace(q.MemoryLimit)) Exec($"SET memory_limit = {SqlText.Literal(q.MemoryLimit)}");
-        if (q.EnableObjectCache) Exec("SET enable_object_cache = true");
-        if (!string.IsNullOrWhiteSpace(q.ExtensionDirectory))
+        try
         {
-            Directory.CreateDirectory(q.ExtensionDirectory);
-            Exec($"SET extension_directory = {SqlText.Literal(Path.GetFullPath(q.ExtensionDirectory))}");
-        }
-
-        var s3Sources = opts.DataSources.Where(s => s.Type == DataSourceType.S3).ToList();
-        if (s3Sources.Count > 0)
-        {
-            var httpfsOk = TryExec("INSTALL httpfs; LOAD httpfs;", out var httpfsError);
-            if (!httpfsOk)
+            Exec($"SET temp_directory = {SqlText.Literal(Path.Combine(tempDir, "spill"))}");
+            if (q.Threads > 0) Exec($"SET threads = {q.Threads}");
+            if (!string.IsNullOrWhiteSpace(q.MemoryLimit)) Exec($"SET memory_limit = {SqlText.Literal(q.MemoryLimit)}");
+            if (q.EnableObjectCache) Exec("SET enable_object_cache = true");
+            if (!string.IsNullOrWhiteSpace(q.ExtensionDirectory))
             {
-                _logger.LogError("Cannot load DuckDB httpfs extension, S3 sources disabled: {Error}", httpfsError);
-            }
-            if (httpfsOk && s3Sources.Any(s => s.UseCredentialChain) && !TryExec("INSTALL aws; LOAD aws;", out var awsError))
-            {
-                _logger.LogWarning("Cannot load DuckDB aws extension (credential chain): {Error}", awsError);
+                Directory.CreateDirectory(q.ExtensionDirectory);
+                Exec($"SET extension_directory = {SqlText.Literal(Path.GetFullPath(q.ExtensionDirectory))}");
             }
 
-            foreach (var src in s3Sources)
+            var s3Sources = sources.Where(s => s.Type == DataSourceType.S3).ToList();
+            if (s3Sources.Count > 0)
             {
+                var httpfsOk = TryExec("INSTALL httpfs; LOAD httpfs;", out var httpfsError);
                 if (!httpfsOk)
+                    logger.LogError("Cannot load DuckDB httpfs extension, S3 sources disabled: {Error}", httpfsError);
+                if (httpfsOk && s3Sources.Any(s => s.UseCredentialChain) && !TryExec("INSTALL aws; LOAD aws;", out var awsError))
+                    logger.LogWarning("Cannot load DuckDB aws extension (credential chain): {Error}", awsError);
+
+                foreach (var src in s3Sources)
                 {
-                    MarkFailed(src.Name, "httpfs extension not available: " + httpfsError);
-                    continue;
-                }
-                if (!TryExec(BuildSecret(src), out var secretError))
-                {
-                    MarkFailed(src.Name, secretError);
-                    _logger.LogError("Cannot configure credentials for source {Source}: {Error}", src.Name, secretError);
+                    if (!httpfsOk)
+                    {
+                        _sourceErrors[src.Name] = "httpfs extension not available: " + httpfsError;
+                        continue;
+                    }
+                    if (!TryExec(BuildSecret(src), out var secretError))
+                    {
+                        _sourceErrors[src.Name] = secretError;
+                        logger.LogError("Cannot configure credentials for source {Source}: {Error}", src.Name, secretError);
+                    }
                 }
             }
+
+            // Sandbox: only the data sources and our temp folder are reachable from SQL.
+            var allowed = sources
+                .Where(s => !_sourceErrors.ContainsKey(s.Name))
+                .Select(s => s.RootUri)
+                .Append(tempDir + Path.DirectorySeparatorChar)
+                .Distinct()
+                .Select(SqlText.Literal);
+            Exec($"SET allowed_directories = [{string.Join(", ", allowed)}]");
+            Exec("SET enable_external_access = false");
+            Exec("SET autoinstall_known_extensions = false");
+            Exec("SET lock_configuration = true");
+
+            using var cmd = _root.CreateCommand();
+            cmd.CommandText = "SELECT version()";
+            Version = cmd.ExecuteScalar()?.ToString() ?? "?";
         }
-
-        // Sandbox: only the data sources and our temp folder are reachable from SQL.
-        var allowed = opts.DataSources
-            .Where(s => !_failedSources.Contains(s.Name))
-            .Select(s => s.RootUri)
-            .Append(tempDir + Path.DirectorySeparatorChar)
-            .Select(SqlText.Literal);
-        Exec($"SET allowed_directories = [{string.Join(", ", allowed)}]");
-        Exec("SET enable_external_access = false");
-        Exec("SET autoinstall_known_extensions = false");
-        Exec("SET lock_configuration = true");
-
-        using var cmd = _root.CreateCommand();
-        cmd.CommandText = "SELECT version()";
-        Version = cmd.ExecuteScalar()?.ToString() ?? "?";
-        _logger.LogInformation("DuckDB {Version} ready (temp: {Temp})", Version, tempDir);
+        catch
+        {
+            _root.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Error that prevented a data source from being configured, if any.</summary>
     public string? GetSourceError(string sourceName) => _sourceErrors.GetValueOrDefault(sourceName);
 
-    /// <summary>Opens a new connection on the shared database. Dispose it after use.</summary>
+    /// <summary>Opens a new connection on this database. Dispose it after use.</summary>
     public DuckDBConnection OpenConnection()
     {
         var c = _root.Duplicate();
         if (c.State != System.Data.ConnectionState.Open) c.Open();
         return c;
-    }
-
-    private void MarkFailed(string source, string error)
-    {
-        _failedSources.Add(source);
-        _sourceErrors[source] = error;
     }
 
     private static string BuildSecret(DataSourceOptions s)
@@ -127,7 +111,8 @@ public sealed class DuckDbEngine : IDisposable
         if (!string.IsNullOrEmpty(s.Endpoint)) parts.Add($"ENDPOINT {SqlText.Literal(s.Endpoint)}");
         if (!string.IsNullOrEmpty(s.UrlStyle)) parts.Add($"URL_STYLE {SqlText.Literal(s.UrlStyle)}");
         if (!s.UseSsl) parts.Add("USE_SSL false");
-        parts.Add($"SCOPE {SqlText.Literal($"s3://{s.Bucket}")}");
+        // Scoped to the source prefix, so two sources on the same bucket can use different keys.
+        parts.Add($"SCOPE {SqlText.Literal(s.RootUri)}");
 
         var name = SqlText.Ident("src_" + SqlText.ToIdentifier(s.Name));
         return $"CREATE OR REPLACE SECRET {name} ({string.Join(", ", parts)})";
@@ -155,6 +140,56 @@ public sealed class DuckDbEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Releases this instance's root connection. Queries still running on duplicated connections
+    /// keep the database alive until they finish.
+    /// </summary>
+    public void Dispose() => _root.Dispose();
+}
+
+/// <summary>
+/// Holds the current <see cref="EngineInstance"/> and builds new ones when the data sources change.
+/// </summary>
+public sealed class DuckDbEngine : IDisposable
+{
+    private readonly ILogger<DuckDbEngine> _logger;
+    private readonly QueryOptions _query;
+    private readonly string _tempDir;
+    private EngineInstance _current;
+
+    public string ExportDirectory { get; }
+    public string Version => _current.Version;
+    public EngineInstance Current => _current;
+
+    public DuckDbEngine(IOptions<ExplorerOptions> options, ILogger<DuckDbEngine> logger)
+    {
+        _logger = logger;
+        _query = options.Value.Query;
+        _tempDir = Path.GetFullPath(string.IsNullOrWhiteSpace(_query.TempDirectory)
+            ? Path.Combine(Path.GetTempPath(), "parquet-explorer")
+            : _query.TempDirectory);
+        ExportDirectory = Path.Combine(_tempDir, "exports");
+        Directory.CreateDirectory(ExportDirectory);
+
+        // Empty until the catalog builds the real instance with the configured sources.
+        _current = new EngineInstance([], _query, _tempDir, logger);
+        _logger.LogInformation("DuckDB {Version} ready (temp: {Temp})", _current.Version, _tempDir);
+    }
+
+    /// <summary>Builds a new sandboxed database for the given sources (not yet active).</summary>
+    public EngineInstance Build(IReadOnlyList<DataSourceOptions> sources) =>
+        new(sources, _query, _tempDir, _logger);
+
+    /// <summary>Makes <paramref name="next"/> the active database and releases the previous one.</summary>
+    public void Activate(EngineInstance next)
+    {
+        var old = Interlocked.Exchange(ref _current, next);
+        if (!ReferenceEquals(old, next)) old.Dispose();
+    }
+
+    /// <summary>Opens a new connection on the active database. Dispose it after use.</summary>
+    public DuckDBConnection OpenConnection() => _current.OpenConnection();
+
     /// <summary>Downloads the extensions needed for S3 (used to pre-bake container images).</summary>
     public static void InstallExtensions(string? extensionDirectory)
     {
@@ -166,5 +201,5 @@ public sealed class DuckDbEngine : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public void Dispose() => _root.Dispose();
+    public void Dispose() => _current.Dispose();
 }

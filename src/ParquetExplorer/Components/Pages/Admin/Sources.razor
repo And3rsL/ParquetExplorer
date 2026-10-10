@@ -1,0 +1,438 @@
+@page "/admin/sources"
+@attribute [Authorize(Roles = Roles.Admin)]
+@rendermode InteractiveServer
+@implements IDisposable
+@inject CatalogService Catalog
+@inject SourceRegistry Registry
+@inject UserStore Users
+@inject Microsoft.Extensions.Options.IOptions<ExplorerOptions> Options
+
+<PageTitle>Data sources · Parquet Explorer</PageTitle>
+
+<AdminShell Title="Data sources"
+            Description="Local folders and S3 buckets exposed as SQL schemas. Every folder containing parquet files becomes a table. Changes apply immediately, without restarting.">
+    <Actions>
+        <button class="btn-primary" @onclick="OpenNew"><Icon Name="plus" /> Add source</button>
+    </Actions>
+    <ChildContent>
+        @if (_message is not null)
+        {
+            <div class="@($"mb-4 flex items-start gap-2 rounded-xl border px-4 py-3 text-sm {(_messageIsError ? "border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-300" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300")}")">
+                <Icon Name="@(_messageIsError ? "alert" : "check")" Class="mt-0.5 size-4 shrink-0" />
+                <span class="flex-1 break-words">@_message</span>
+                <button class="opacity-60 hover:opacity-100" @onclick="() => _message = null"><Icon Name="x" Class="size-3.5" /></button>
+            </div>
+        }
+
+        <div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <table class="w-full text-sm">
+                <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wider text-slate-500 dark:border-slate-800 dark:bg-slate-900/60">
+                    <tr>
+                        <th class="px-4 py-3 font-medium">Source</th>
+                        <th class="px-4 py-3 font-medium">Location</th>
+                        <th class="px-4 py-3 font-medium">Status</th>
+                        <th class="px-4 py-3 font-medium"></th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-200 dark:divide-slate-800">
+                    @foreach (var src in Catalog.Sources)
+                    {
+                        var def = Registry.Find(src.Name);
+                        var managed = def?.IsManaged == true;
+                        <tr class="align-top hover:bg-slate-50/60 dark:hover:bg-slate-800/30">
+                            <td class="px-4 py-3">
+                                <div class="flex items-center gap-2.5">
+                                    <div class="grid size-9 shrink-0 place-items-center rounded-lg @(src.Type == DataSourceType.S3 ? "bg-sky-500/10 text-sky-500" : "bg-indigo-500/10 text-indigo-500")">
+                                        <Icon Name="@(src.Type == DataSourceType.S3 ? "cloud" : "hard-drive")" />
+                                    </div>
+                                    <div>
+                                        <div class="font-medium text-slate-900 dark:text-white">@src.Name</div>
+                                        <div class="flex items-center gap-1.5 text-xs text-slate-500">
+                                            <span>@(src.Type == DataSourceType.S3 ? "S3" : "Local folder")</span>
+                                            <span>·</span>
+                                            @if (managed)
+                                            {
+                                                <span title="@($"Added by {def!.CreatedBy} on {def.CreatedAt:g}")">added by @def!.CreatedBy</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="rounded bg-slate-100 px-1.5 text-[10px] font-medium uppercase dark:bg-slate-800" title="Defined in appsettings / environment variables">configuration</span>
+                                            }
+                                        </div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="max-w-xs px-4 py-3">
+                                <div class="truncate font-mono text-xs text-slate-600 dark:text-slate-300" title="@src.RootUri">@src.RootUri</div>
+                                @if (src.Type == DataSourceType.S3 && !string.IsNullOrEmpty(src.Options.Endpoint))
+                                {
+                                    <div class="truncate text-xs text-slate-400">endpoint @src.Options.Endpoint</div>
+                                }
+                            </td>
+                            <td class="px-4 py-3">
+                                @if (src.Loading)
+                                {
+                                    <span class="inline-flex items-center gap-1.5 text-xs text-slate-500"><Icon Name="refresh" Class="size-3.5 animate-spin" /> Loading…</span>
+                                }
+                                else if (src.Error is not null)
+                                {
+                                    <span class="inline-flex max-w-xs items-start gap-1.5 text-xs text-rose-500" title="@src.Error"><Icon Name="alert" Class="mt-0.5 size-3.5 shrink-0" /> <span class="line-clamp-2">@src.Error</span></span>
+                                }
+                                else
+                                {
+                                    <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                                        <span class="size-1.5 rounded-full bg-emerald-500"></span> @src.Tables.Count table@(src.Tables.Count == 1 ? "" : "s")
+                                    </span>
+                                    @if (src.LastRefresh is { } lr)
+                                    {
+                                        <div class="mt-1 text-[11px] text-slate-400">scanned @lr.ToString("HH:mm:ss")@(src.RefreshDuration is { } d ? $" in {Format.Duration(d)}" : "")</div>
+                                    }
+                                }
+                            </td>
+                            <td class="px-4 py-3">
+                                <div class="flex justify-end gap-1">
+                                    <button class="btn-icon" title="Re-scan folders" disabled="@src.Loading" @onclick="() => Refresh(src.Name)"><Icon Name="refresh" /></button>
+                                    @if (managed)
+                                    {
+                                        <button class="btn-icon" title="Edit" @onclick="() => OpenEdit(def!)"><Icon Name="pencil" /></button>
+                                        <button class="btn-icon hover:!text-rose-500" title="Delete" @onclick="() => _deleting = src.Name"><Icon Name="trash" /></button>
+                                    }
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                    @if (Catalog.Sources.Count == 0)
+                    {
+                        <tr>
+                            <td colspan="4" class="px-4 py-12 text-center text-sm text-slate-500">
+                                No data sources yet. <button class="font-medium text-indigo-600 hover:underline dark:text-indigo-400" @onclick="OpenNew">Add the first one</button>.
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+
+        <p class="mt-4 text-xs text-slate-400">
+            Sources marked <em>configuration</em> are defined in <code>appsettings.json</code> or environment variables and can only be changed there.
+            S3 secrets are stored encrypted on the server.
+        </p>
+    </ChildContent>
+</AdminShell>
+
+@* ---------- Add / edit ---------- *@
+<Modal Open="_form is not null" OnClose="CloseForm" Width="max-w-2xl"
+       Title="@(_originalName is null ? "Add data source" : $"Edit {_originalName}")"
+       Subtitle="Each folder with parquet files will appear as a table: name.folder">
+    <ChildContent>
+        @if (_form is { } f)
+        {
+            <div class="space-y-5">
+                <div class="grid gap-4 sm:grid-cols-2">
+                    <Field Label="Name" Hint="Used as SQL schema, e.g. SELECT * FROM name.table">
+                        <input class="input" @bind="f.Name" @bind:event="oninput" placeholder="lake" />
+                    </Field>
+                    <Field Label="Type">
+                        <div class="grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800">
+                            <button type="button" class="@Seg(f.Type == DataSourceType.Local)" @onclick="() => f.Type = DataSourceType.Local"><Icon Name="hard-drive" Class="size-3.5" /> Local folder</button>
+                            <button type="button" class="@Seg(f.Type == DataSourceType.S3)" @onclick="() => f.Type = DataSourceType.S3"><Icon Name="cloud" Class="size-3.5" /> S3 bucket</button>
+                        </div>
+                    </Field>
+                </div>
+
+                @if (f.Type == DataSourceType.Local)
+                {
+                    <Field Label="Folder path (on the server)" Hint="@LocalHint">
+                        <input class="input font-mono" @bind="f.Path" placeholder="/mnt/datalake/sales" />
+                    </Field>
+                }
+                else
+                {
+                    <div class="grid gap-4 sm:grid-cols-2">
+                        <Field Label="Bucket"><input class="input font-mono" @bind="f.Bucket" placeholder="my-bucket" /></Field>
+                        <Field Label="Prefix" Hint="Optional folder inside the bucket"><input class="input font-mono" @bind="f.Prefix" placeholder="warehouse/" /></Field>
+                        <Field Label="Region"><input class="input font-mono" @bind="f.Region" placeholder="eu-west-1" /></Field>
+                        <Field Label="Endpoint" Hint="Only for MinIO, R2, Ceph… (host:port)"><input class="input font-mono" @bind="f.Endpoint" placeholder="minio.local:9000" /></Field>
+                        <Field Label="URL style">
+                            <select class="input" @bind="f.UrlStyle">
+                                <option value="">Default (virtual host)</option>
+                                <option value="vhost">Virtual host</option>
+                                <option value="path">Path (MinIO)</option>
+                            </select>
+                        </Field>
+                        <Field Label="Connection">
+                            <label class="flex h-[38px] items-center gap-2 text-sm"><input type="checkbox" class="size-4 accent-indigo-600" @bind="f.UseSsl" /> Use HTTPS</label>
+                        </Field>
+                    </div>
+
+                    <div class="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+                        <div class="mb-3 flex items-center justify-between">
+                            <span class="text-sm font-medium">Credentials</span>
+                            <label class="flex items-center gap-2 text-xs text-slate-500">
+                                <input type="checkbox" class="size-3.5 accent-indigo-600" @bind="f.UseCredentialChain" /> Use server credential chain (env, ~/.aws, IAM role)
+                            </label>
+                        </div>
+                        @if (!f.UseCredentialChain)
+                        {
+                            <div class="grid gap-4 sm:grid-cols-2">
+                                <Field Label="Access key ID"><input class="input font-mono" @bind="f.AccessKeyId" autocomplete="off" /></Field>
+                                <Field Label="Secret access key" Hint="@(f.HasStoredSecret ? "Leave empty to keep the stored secret" : null)">
+                                    <input class="input font-mono" type="password" @bind="f.SecretAccessKey" autocomplete="new-password" placeholder="@(f.HasStoredSecret ? "••••••••  (stored)" : "")" />
+                                </Field>
+                                <Field Label="Session token" Hint="Optional, temporary credentials">
+                                    <input class="input font-mono" type="password" @bind="f.SessionToken" autocomplete="off" placeholder="@(f.HasStoredToken ? "••••••••  (stored)" : "")" />
+                                </Field>
+                            </div>
+                            <p class="mt-2 text-xs text-slate-400">Leave both keys empty for public buckets.</p>
+                        }
+                    </div>
+                }
+
+                <details class="group rounded-xl border border-slate-200 px-4 py-3 dark:border-slate-800">
+                    <summary class="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-300">Advanced options</summary>
+                    <div class="mt-3 space-y-2 text-sm">
+                        <label class="flex items-start gap-2"><input type="checkbox" class="mt-0.5 size-4 accent-indigo-600" @bind="f.UnionByName" />
+                            <span>Union by name <span class="block text-xs text-slate-400">Merge files with different column sets (reads every file footer, slower to load).</span></span></label>
+                        <label class="flex items-start gap-2"><input type="checkbox" class="mt-0.5 size-4 accent-indigo-600" @bind="f.RootFilesAsTables" />
+                            <span>Root files as tables <span class="block text-xs text-slate-400">Each parquet file directly in the root becomes its own table.</span></span></label>
+                    </div>
+                </details>
+
+                @if (_formError is not null)
+                {
+                    <div class="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-300">
+                        <Icon Name="alert" Class="mt-0.5 size-4 shrink-0" /> <span class="break-words">@_formError</span>
+                    </div>
+                }
+                @if (_test is { } t)
+                {
+                    <div class="@($"rounded-lg border px-3 py-2 text-sm {(t.Success ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-300")}")">
+                        <div class="flex items-start gap-2"><Icon Name="@(t.Success ? "check" : "alert")" Class="mt-0.5 size-4 shrink-0" /> <span class="break-words">@t.Message</span></div>
+                        @if (t.SampleTables is { Count: > 0 } names)
+                        {
+                            <div class="mt-2 flex flex-wrap gap-1 pl-6">
+                                @foreach (var n in names)
+                                {
+                                    <span class="rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[11px]">@n</span>
+                                }
+                                @if (t.Tables > names.Count) { <span class="text-xs">+@(t.Tables - names.Count) more</span> }
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </ChildContent>
+    <Footer>
+        <button class="btn-ghost mr-auto" @onclick="Test" disabled="@(_busy)">
+            <Icon Name="@(_testing ? "refresh" : "plug")" Class="@(_testing ? "size-4 animate-spin" : "size-4")" /> Test connection
+        </button>
+        <button class="btn-ghost" @onclick="CloseForm" disabled="@_busy">Cancel</button>
+        <button class="btn-primary" @onclick="Save" disabled="@_busy">
+            @if (_saving) { <Icon Name="refresh" Class="size-4 animate-spin" /> }
+            Save
+        </button>
+    </Footer>
+</Modal>
+
+@* ---------- Delete confirmation ---------- *@
+<Modal Open="_deleting is not null" OnClose="() => _deleting = null" Title="Delete data source?" Width="max-w-md">
+    <ChildContent>
+        <p class="text-sm text-slate-600 dark:text-slate-300">
+            The schema <span class="font-mono font-semibold">@_deleting</span> and all its tables will disappear from the explorer.
+            Files are <strong>not</strong> touched. Saved queries using it will stop working.
+        </p>
+    </ChildContent>
+    <Footer>
+        <button class="btn-ghost" @onclick="() => _deleting = null" disabled="@_saving">Cancel</button>
+        <button class="btn-danger" @onclick="Delete" disabled="@_saving">
+            @if (_saving) { <Icon Name="refresh" Class="size-4 animate-spin" /> }
+            Delete
+        </button>
+    </Footer>
+</Modal>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private sealed class SourceForm
+    {
+        public string Name { get; set; } = "";
+        public DataSourceType Type { get; set; } = DataSourceType.Local;
+        public string? Path { get; set; }
+        public string? Bucket { get; set; }
+        public string? Prefix { get; set; }
+        public string? Region { get; set; }
+        public string? Endpoint { get; set; }
+        public string UrlStyle { get; set; } = "";
+        public bool UseSsl { get; set; } = true;
+        public bool UseCredentialChain { get; set; }
+        public string? AccessKeyId { get; set; }
+        public string? SecretAccessKey { get; set; }
+        public string? SessionToken { get; set; }
+        public bool HasStoredSecret { get; set; }
+        public bool HasStoredToken { get; set; }
+        public bool UnionByName { get; set; }
+        public bool RootFilesAsTables { get; set; } = true;
+    }
+
+    private string _me = "";
+    private SourceForm? _form;
+    private string? _originalName;
+    private string? _formError;
+    private CatalogService.TestResult? _test;
+    private bool _saving, _testing;
+    private bool _busy => _saving || _testing;
+    private string? _deleting;
+    private string? _message;
+    private bool _messageIsError;
+
+    private string LocalHint => Options.Value.SourceManagement.AllowedLocalRoots is { Length: > 0 } roots
+        ? $"Absolute path. Allowed roots: {string.Join(", ", roots)}"
+        : "Absolute path of a folder readable by the server process";
+
+    protected override async Task OnInitializedAsync()
+    {
+        _me = (await AuthState).User.Identity?.Name ?? "";
+        Catalog.Changed += OnChanged;
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    private static string Seg(bool active) => active
+        ? "flex items-center justify-center gap-1.5 rounded-md bg-white py-1.5 text-sm font-medium text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white"
+        : "flex items-center justify-center gap-1.5 rounded-md py-1.5 text-sm text-slate-500 hover:text-slate-800 dark:hover:text-slate-200";
+
+    private void OpenNew()
+    {
+        _originalName = null;
+        _form = new SourceForm();
+        _formError = null;
+        _test = null;
+    }
+
+    private void OpenEdit(SourceDefinition def)
+    {
+        var o = def.Options;
+        _originalName = o.Name;
+        _form = new SourceForm
+        {
+            Name = o.Name, Type = o.Type, Path = o.Path, Bucket = o.Bucket, Prefix = o.Prefix, Region = o.Region,
+            Endpoint = o.Endpoint, UrlStyle = o.UrlStyle ?? "", UseSsl = o.UseSsl, UseCredentialChain = o.UseCredentialChain,
+            AccessKeyId = o.AccessKeyId, HasStoredSecret = !string.IsNullOrEmpty(o.SecretAccessKey),
+            HasStoredToken = !string.IsNullOrEmpty(o.SessionToken),
+            UnionByName = o.UnionByName, RootFilesAsTables = o.RootFilesAsTables,
+        };
+        _formError = null;
+        _test = null;
+    }
+
+    private void CloseForm()
+    {
+        if (_busy) return;
+        _form = null;
+    }
+
+    /// <summary>Builds the options from the form, keeping stored secrets when the fields are left empty.</summary>
+    private DataSourceOptions BuildOptions(SourceForm f)
+    {
+        var stored = _originalName is null ? null : Registry.Find(_originalName)?.Options;
+        return new DataSourceOptions
+        {
+            Name = f.Name, Type = f.Type, Path = f.Path, Bucket = f.Bucket, Prefix = f.Prefix, Region = f.Region,
+            Endpoint = f.Endpoint, UrlStyle = f.UrlStyle, UseSsl = f.UseSsl, UseCredentialChain = f.UseCredentialChain,
+            AccessKeyId = string.IsNullOrWhiteSpace(f.AccessKeyId) ? null : f.AccessKeyId.Trim(),
+            SecretAccessKey = !string.IsNullOrEmpty(f.SecretAccessKey) ? f.SecretAccessKey : f.HasStoredSecret ? stored?.SecretAccessKey : null,
+            SessionToken = !string.IsNullOrEmpty(f.SessionToken) ? f.SessionToken : f.HasStoredToken ? stored?.SessionToken : null,
+            UnionByName = f.UnionByName, RootFilesAsTables = f.RootFilesAsTables,
+        };
+    }
+
+    private bool EnsureAdmin()
+    {
+        if (Users.IsAdmin(_me)) return true;
+        _formError = "Your account is no longer an administrator.";
+        return false;
+    }
+
+    private async Task Test()
+    {
+        if (_form is null || !EnsureAdmin()) return;
+        _formError = null;
+        _test = null;
+        var opts = BuildOptions(_form);
+        if (Registry.Validate(opts, opts.Name) is { } error) // name clashes do not matter for a test
+        {
+            _formError = error;
+            return;
+        }
+        _testing = true;
+        try { _test = await Catalog.TestAsync(opts); }
+        finally { _testing = false; }
+    }
+
+    private async Task Save()
+    {
+        if (_form is null || !EnsureAdmin()) return;
+        _formError = null;
+        var opts = BuildOptions(_form);
+        if (Registry.Validate(opts, _originalName) is { } error)
+        {
+            _formError = error;
+            return;
+        }
+
+        _saving = true;
+        try
+        {
+            Registry.Save(opts, _originalName, _me);
+            var name = opts.Name;
+            _form = null;
+            await Catalog.ReloadAsync();
+            var info = Catalog.Sources.FirstOrDefault(s => s.Name == name);
+            ShowMessage(info?.Error is { } e
+                ? $"Source '{name}' saved, but it could not be loaded: {e}"
+                : $"Source '{name}' saved: {info?.Tables.Count ?? 0} table(s) available.", info?.Error is not null);
+        }
+        catch (Exception ex)
+        {
+            _formError = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private async Task Delete()
+    {
+        if (_deleting is not { } name || !EnsureAdmin()) return;
+        _saving = true;
+        try
+        {
+            Registry.Delete(name, _me);
+            _deleting = null;
+            await Catalog.ReloadAsync();
+            ShowMessage($"Source '{name}' deleted.", false);
+        }
+        catch (Exception ex)
+        {
+            _deleting = null;
+            ShowMessage(ex.Message, true);
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private Task Refresh(string name) => Catalog.RefreshAsync(name);
+
+    private void ShowMessage(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+
+    public void Dispose() => Catalog.Changed -= OnChanged;
+}
