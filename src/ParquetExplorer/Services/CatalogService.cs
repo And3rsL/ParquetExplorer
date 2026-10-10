@@ -58,31 +58,47 @@ public sealed partial class CatalogService
     /// <summary>
     /// Rebuilds the whole catalog on a fresh sandboxed database (needed when sources are added,
     /// changed or removed) and switches to it atomically. Running queries finish on the old one.
+    /// Sources whose settings did not change reuse their previous scan instead of listing files again.
     /// </summary>
     public async Task ReloadAsync(CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);
         try
         {
+            var previous = _sources;
             var options = _registry.AllOptions;
             var infos = CreateInfos(options);
-            // Keep showing the previous tables while loading, mark everything as loading.
+            var reuse = new Dictionary<SourceInfo, IReadOnlyList<TableInfo>?>();
             foreach (var info in infos)
-                info.Tables = _sources.FirstOrDefault(o => o.Name.Equals(info.Name, StringComparison.OrdinalIgnoreCase))?.Tables ?? [];
+            {
+                var old = previous.FirstOrDefault(o => o.Name.Equals(info.Name, StringComparison.OrdinalIgnoreCase));
+                // Keep showing the previous tables while loading.
+                info.Tables = old?.Tables ?? [];
+                reuse[info] = old is { Error: null, Loading: false, LastRefresh: not null } && old.Schema == info.Schema && SameSettings(old.Options, info.Options)
+                    ? old.Tables
+                    : null;
+            }
             _sources = infos;
             Changed?.Invoke();
 
             var instance = await Task.Run(() => _engine.Build(options), ct);
+
+            // At start-up nothing is queryable yet: activate right away so each source becomes
+            // available as soon as it is loaded. Otherwise keep serving the old catalog until the
+            // new one is complete.
+            var progressive = !_loadedOnce;
+            if (progressive) _engine.Activate(instance);
             try
             {
-                await Task.WhenAll(infos.Select(i => LoadSourceAsync(i, instance, ct)));
+                await Task.WhenAll(infos.Select(i => LoadSourceAsync(i, instance, reuse[i], viewsExist: false, ct)));
             }
-            catch
+            catch when (!progressive)
             {
                 instance.Dispose();
                 throw;
             }
-            _engine.Activate(instance);
+            if (!progressive) _engine.Activate(instance);
+            _loadedOnce = true;
         }
         finally
         {
@@ -91,7 +107,12 @@ public sealed partial class CatalogService
         }
     }
 
-    /// <summary>Re-scans every source for new or removed folders (same database).</summary>
+    private bool _loadedOnce;
+
+    private static bool SameSettings(DataSourceOptions a, DataSourceOptions b) =>
+        System.Text.Json.JsonSerializer.Serialize(a) == System.Text.Json.JsonSerializer.Serialize(b);
+
+    /// <summary>Re-scans every source for new, changed or removed folders (same database).</summary>
     public async Task RefreshAllAsync(CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);
@@ -100,7 +121,7 @@ public sealed partial class CatalogService
             var instance = _engine.Current;
             foreach (var i in _sources) i.Loading = true;
             Changed?.Invoke();
-            await Task.WhenAll(_sources.Select(i => LoadSourceAsync(i, instance, ct)));
+            await Task.WhenAll(_sources.Select(i => LoadSourceAsync(i, instance, reuseTables: null, viewsExist: true, ct)));
         }
         finally
         {
@@ -109,7 +130,7 @@ public sealed partial class CatalogService
         }
     }
 
-    /// <summary>Re-scans one source for new or removed folders (same database).</summary>
+    /// <summary>Re-scans one source for new, changed or removed folders (same database).</summary>
     public async Task RefreshAsync(string sourceName, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);
@@ -119,7 +140,7 @@ public sealed partial class CatalogService
             if (info is null) return;
             info.Loading = true;
             Changed?.Invoke();
-            await LoadSourceAsync(info, _engine.Current, ct);
+            await LoadSourceAsync(info, _engine.Current, reuseTables: null, viewsExist: true, ct);
         }
         finally
         {
@@ -149,7 +170,12 @@ public sealed partial class CatalogService
         }
     }
 
-    private async Task LoadSourceAsync(SourceInfo info, EngineInstance instance, CancellationToken ct)
+    /// <param name="reuseTables">Tables from a previous scan to use instead of listing files again.</param>
+    /// <param name="viewsExist">
+    /// True when refreshing the active database: views of tables whose files did not change are kept as they are.
+    /// </param>
+    private async Task LoadSourceAsync(SourceInfo info, EngineInstance instance, IReadOnlyList<TableInfo>? reuseTables,
+        bool viewsExist, CancellationToken ct)
     {
         var opts = info.Options;
         info.Loading = true;
@@ -159,15 +185,41 @@ public sealed partial class CatalogService
             var engineError = instance.GetSourceError(opts.Name);
             if (engineError is not null) throw new InvalidOperationException(engineError);
 
-            var files = await Task.Run(() => ListFiles(opts, instance), ct);
-            var tables = BuildTables(opts, info.Schema, files);
-            await DescribeTablesAsync(opts, tables, instance, ct);
-            await Task.Run(() => CreateViews(info, tables, instance), ct);
+            List<TableInfo> tables;
+            var fileCount = 0;
+            if (reuseTables is not null)
+            {
+                tables = reuseTables.ToList();
+            }
+            else
+            {
+                var files = await Task.Run(() => ListFiles(opts, instance), ct);
+                fileCount = files.Count;
+                tables = BuildTables(opts, info.Schema, files);
+            }
+
+            // Views whose files did not change are kept (with their columns) when refreshing.
+            var unchanged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (viewsExist)
+            {
+                var before = info.Tables.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
+                foreach (var t in tables)
+                {
+                    if (before.TryGetValue(t.Name, out var old) && old.Error is null && old.Fingerprint == t.Fingerprint
+                        && old.Locations.SequenceEqual(t.Locations))
+                    {
+                        t.Columns = old.Columns;
+                        unchanged.Add(t.Name);
+                    }
+                }
+            }
+
+            var created = await Task.Run(() => CreateViews(info, tables, unchanged, instance, ct), ct);
 
             info.Tables = tables.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase).ToList();
             info.Error = null;
-            _logger.LogInformation("Source {Source}: {Tables} tables, {Files} files in {Elapsed} ms",
-                opts.Name, tables.Count, files.Count, sw.ElapsedMilliseconds);
+            _logger.LogInformation("Source {Source}: {Tables} tables ({Created} (re)created), {Files} files in {Elapsed} ms",
+                opts.Name, tables.Count, created, reuseTables is null ? fileCount : tables.Sum(t => t.FileCount), sw.ElapsedMilliseconds);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -184,7 +236,7 @@ public sealed partial class CatalogService
         }
     }
 
-    private sealed record FileEntry(string Uri, string Relative, long? Size);
+    private sealed record FileEntry(string Uri, string Relative, long? Size, DateTime? LastWriteUtc);
 
     private static List<FileEntry> ListFiles(DataSourceOptions src, EngineInstance instance)
     {
@@ -203,7 +255,7 @@ public sealed partial class CatalogService
             };
             return new DirectoryInfo(root).EnumerateFiles("*", enumOpts)
                 .Where(f => IsParquet(f.Name))
-                .Select(f => new FileEntry(f.FullName, Path.GetRelativePath(root, f.FullName).Replace('\\', '/'), f.Length))
+                .Select(f => new FileEntry(f.FullName, Path.GetRelativePath(root, f.FullName).Replace('\\', '/'), f.Length, f.LastWriteTimeUtc))
                 .Where(f => !IsIgnored(f.Relative))
                 .ToList();
         }
@@ -221,7 +273,7 @@ public sealed partial class CatalogService
             var uri = reader.GetString(0);
             if (!uri.StartsWith(rootUri, StringComparison.Ordinal)) continue;
             var rel = uri[rootUri.Length..];
-            if (!IsIgnored(rel)) list.Add(new FileEntry(uri, rel, null));
+            if (!IsIgnored(rel)) list.Add(new FileEntry(uri, rel, null, null));
         }
         return list;
     }
@@ -233,6 +285,18 @@ public sealed partial class CatalogService
     [GeneratedRegex(@"^[^=/]+=[^/]*$")]
     private static partial Regex PartitionSegment();
 
+    private sealed class TableGroup
+    {
+        public List<FileEntry> Files { get; } = [];
+        public List<string> Keys { get; } = [];
+        public Dictionary<string, HashSet<string>> Values { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> Exts { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Folder layout below the table folder, e.g. "year=*/month=*". Null when files are at mixed depths.</summary>
+        public string? Layout { get; set; }
+        public bool LayoutMixed { get; set; }
+    }
+
     private static List<TableInfo> BuildTables(DataSourceOptions src, string schema, List<FileEntry> files)
     {
         var tables = new List<TableInfo>();
@@ -240,7 +304,7 @@ public sealed partial class CatalogService
         var sep = src.Type == DataSourceType.Local ? Path.DirectorySeparatorChar.ToString() : "/";
 
         // Group files by "table folder" = parent folder without trailing partition segments.
-        var groups = new Dictionary<string, (List<FileEntry> Files, HashSet<string> Keys, HashSet<string> Exts)>(StringComparer.Ordinal);
+        var groups = new Dictionary<string, TableGroup>(StringComparer.Ordinal);
         foreach (var f in files)
         {
             var segs = f.Relative.Split('/');
@@ -256,14 +320,30 @@ public sealed partial class CatalogService
 
             if (!groups.TryGetValue(key, out var g))
             {
-                g = ([], new HashSet<string>(StringComparer.Ordinal), new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                g = new TableGroup();
                 groups[key] = g;
             }
             g.Files.Add(f);
             g.Exts.Add(Path.GetExtension(f.Relative));
-            if (firstPartition >= 0)
-                foreach (var d in dirs[firstPartition..])
-                    if (PartitionSegment().IsMatch(d)) g.Keys.Add(d[..d.IndexOf('=')]);
+
+            var below = firstPartition >= 0 ? dirs[firstPartition..] : [];
+            var layout = string.Join('/', below.Select(d => PartitionSegment().IsMatch(d) ? d[..d.IndexOf('=')] + "=*" : "*"));
+            if (g.Layout is null && !g.LayoutMixed) g.Layout = layout;
+            else if (g.Layout != layout) { g.LayoutMixed = true; g.Layout = null; }
+
+            foreach (var d in below)
+            {
+                if (!PartitionSegment().IsMatch(d)) continue;
+                var eq = d.IndexOf('=');
+                var k = d[..eq];
+                if (!g.Values.TryGetValue(k, out var values))
+                {
+                    values = new HashSet<string>(StringComparer.Ordinal);
+                    g.Values[k] = values;
+                    g.Keys.Add(k);
+                }
+                if (values.Count < 100_000) values.Add(d[(eq + 1)..]);
+            }
         }
 
         foreach (var (key, g) in groups.OrderBy(k => k.Key, StringComparer.Ordinal))
@@ -283,7 +363,10 @@ public sealed partial class CatalogService
             {
                 rawName = rel.Length == 0 ? src.Name : rel;
                 var dirUri = src.RootUri + (rel.Length == 0 ? "" : rel.Replace("/", sep) + sep);
-                var pattern = hive ? "**" + sep + "*" : "*";
+                // A glob naming each level ("year=*/month=*/*.parquet") lists and matches less than "**".
+                var pattern = !hive ? "*"
+                    : g.Layout is { Length: > 0 } layout ? layout.Replace("/", sep) + sep + "*"
+                    : "**" + sep + "*";
                 locations = g.Exts.Select(e => dirUri + pattern + e).ToList();
             }
 
@@ -296,12 +379,56 @@ public sealed partial class CatalogService
                 Locations = locations,
                 IsSingleFile = isFile,
                 HivePartitioned = hive,
-                PartitionKeys = g.Keys.ToList(),
+                PartitionKeys = g.Keys,
+                PartitionTypes = g.Keys.ToDictionary(k => k, k => InferPartitionType(g.Values[k])),
                 FileCount = g.Files.Count,
                 TotalBytes = g.Files.All(f => f.Size.HasValue) ? g.Files.Sum(f => f.Size!.Value) : null,
+                Fingerprint = Fingerprint(g.Files),
             });
         }
         return tables;
+    }
+
+    [GeneratedRegex(@"^-?\d{1,18}$")]
+    private static partial Regex IntegerValue();
+
+    [GeneratedRegex(@"^\d{4}-\d{2}-\d{2}$")]
+    private static partial Regex DateValue();
+
+    /// <summary>
+    /// Type of a partition column from its folder values. Passing it to DuckDB avoids type
+    /// auto-detection over every path on each bind.
+    /// </summary>
+    private static string InferPartitionType(HashSet<string> values)
+    {
+        if (values.Count == 0) return "VARCHAR";
+        if (values.All(v => IntegerValue().IsMatch(v))) return "BIGINT";
+        if (values.All(v => DateValue().IsMatch(v) && DateOnly.TryParseExact(v, "yyyy-MM-dd", out _))) return "DATE";
+        return "VARCHAR";
+    }
+
+    /// <summary>Order independent fingerprint of a file set (names, sizes and modification times when known).</summary>
+    private static string Fingerprint(List<FileEntry> files)
+    {
+        ulong sum = 0, xor = 0;
+        foreach (var f in files)
+        {
+            var h = Fnv1a(f.Relative) ^ (ulong)(f.Size ?? 0) * 0x9E3779B97F4A7C15UL ^ (ulong)(f.LastWriteUtc?.Ticks ?? 0);
+            sum += h;
+            xor ^= h * 0xBF58476D1CE4E5B9UL;
+        }
+        return $"{files.Count}:{sum:x16}:{xor:x16}";
+    }
+
+    private static ulong Fnv1a(string s)
+    {
+        var h = 14695981039346656037UL;
+        foreach (var c in s)
+        {
+            h ^= c;
+            h *= 1099511628211UL;
+        }
+        return h;
     }
 
     private static string ReadParquetExpr(DataSourceOptions src, TableInfo t)
@@ -310,41 +437,21 @@ public sealed partial class CatalogService
             ? SqlText.Literal(t.Locations[0])
             : "[" + string.Join(", ", t.Locations.Select(SqlText.Literal)) + "]";
         var args = new List<string> { files };
-        if (t.HivePartitioned) args.Add("hive_partitioning = true");
+        if (t.HivePartitioned)
+        {
+            args.Add("hive_partitioning = true");
+            args.Add("hive_types = {" + string.Join(", ", t.PartitionTypes.Select(kv => $"{SqlText.Literal(kv.Key)}: {kv.Value}")) + "}");
+        }
         if (src.UnionByName || t.Locations.Count > 1) args.Add("union_by_name = true");
         return $"read_parquet({string.Join(", ", args)})";
     }
 
-    /// <summary>Reads table schemas in parallel (only parquet footers are touched).</summary>
-    private static async Task DescribeTablesAsync(DataSourceOptions src, List<TableInfo> tables, EngineInstance instance, CancellationToken ct)
-    {
-        var parallelism = src.Type == DataSourceType.S3 ? 16 : Math.Max(4, Environment.ProcessorCount);
-        await Parallel.ForEachAsync(tables, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
-            (t, _) =>
-            {
-                try
-                {
-                    using var conn = instance.OpenConnection();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = $"DESCRIBE SELECT * FROM {ReadParquetExpr(src, t)}";
-                    using var r = cmd.ExecuteReader();
-                    var cols = new List<ColumnInfo>();
-                    while (r.Read())
-                    {
-                        var name = r.GetString(0);
-                        cols.Add(new ColumnInfo(name, r.GetString(1), t.PartitionKeys.Contains(name)));
-                    }
-                    t.Columns = cols;
-                }
-                catch (Exception ex)
-                {
-                    t.Error = ex.Message;
-                }
-                return ValueTask.CompletedTask;
-            });
-    }
-
-    private static void CreateViews(SourceInfo info, List<TableInfo> tables, EngineInstance instance)
+    /// <summary>
+    /// Creates (or replaces) the views of a source in parallel and reads their columns from the catalog.
+    /// Only a view's binding touches the files: DuckDB lists them and reads one footer for the schema.
+    /// </summary>
+    /// <returns>Number of views (re)created.</returns>
+    private static int CreateViews(SourceInfo info, List<TableInfo> tables, HashSet<string> unchanged, EngineInstance instance, CancellationToken ct)
     {
         var src = info.Options;
         using var conn = instance.OpenConnection();
@@ -365,21 +472,49 @@ public sealed partial class CatalogService
             using var r = cmd.ExecuteReader();
             while (r.Read()) existing.Add(r.GetString(0));
         }
-        var keep = tables.Where(t => t.Error is null).Select(t => t.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var keep = tables.Select(t => t.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var v in existing.Where(v => !keep.Contains(v)))
             Exec($"DROP VIEW IF EXISTS {SqlText.Qualified(info.Schema, v)}");
 
-        foreach (var t in tables.Where(t => t.Error is null))
+        var todo = tables.Where(t => !unchanged.Contains(t.Name)).ToList();
+        var parallelism = src.Type == DataSourceType.S3 ? 16 : Math.Clamp(Environment.ProcessorCount, 4, 16);
+        Parallel.ForEach(todo, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct }, t =>
         {
+            t.Error = null;
             try
             {
-                Exec($"CREATE OR REPLACE VIEW {t.QualifiedName} AS SELECT * FROM {ReadParquetExpr(src, t)}");
+                using var c = instance.OpenConnection();
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = $"CREATE OR REPLACE VIEW {t.QualifiedName} AS SELECT * FROM {ReadParquetExpr(src, t)}";
+                cmd.ExecuteNonQuery();
             }
             catch (Exception ex)
             {
                 t.Error = ex.Message;
+                t.Columns = [];
+            }
+        });
+
+        // Columns of the new views, straight from DuckDB's catalog (no file access).
+        var columns = new Dictionary<string, List<ColumnInfo>>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = $"SELECT table_name, column_name, data_type FROM duckdb_columns() WHERE schema_name = {SqlText.Literal(info.Schema)} ORDER BY table_name, column_index";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var table = r.GetString(0);
+                if (!columns.TryGetValue(table, out var list)) columns[table] = list = [];
+                list.Add(new ColumnInfo(r.GetString(1), r.GetString(2), false));
             }
         }
+        foreach (var t in todo.Where(t => t.Error is null))
+        {
+            t.Columns = columns.TryGetValue(t.Name, out var cols)
+                ? cols.Select(c => c with { IsPartitionKey = t.PartitionKeys.Contains(c.Name) }).ToList()
+                : [];
+        }
+        return todo.Count;
     }
 
     private static string Unique(string name, HashSet<string> used)

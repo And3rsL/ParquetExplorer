@@ -29,7 +29,11 @@ public sealed class EngineInstance : IDisposable
             Exec($"SET temp_directory = {SqlText.Literal(Path.Combine(tempDir, "spill"))}");
             if (q.Threads > 0) Exec($"SET threads = {q.Threads}");
             if (!string.IsNullOrWhiteSpace(q.MemoryLimit)) Exec($"SET memory_limit = {SqlText.Literal(q.MemoryLimit)}");
-            if (q.EnableObjectCache) Exec("SET enable_object_cache = true");
+            // Keeps parquet footers (schema, row group statistics) in memory between queries.
+            if (q.EnableObjectCache) Exec("SET parquet_metadata_cache = true");
+            // Late materialization turns "SELECT * ... LIMIT n" into a second scan joined on row numbers:
+            // over thousands of files it reads every file instead of stopping after n rows.
+            if (!q.LateMaterialization) Exec("SET disabled_optimizers = 'late_materialization'");
             if (!string.IsNullOrWhiteSpace(q.ExtensionDirectory))
             {
                 Directory.CreateDirectory(q.ExtensionDirectory);
@@ -44,6 +48,9 @@ public sealed class EngineInstance : IDisposable
                     logger.LogError("Cannot load DuckDB httpfs extension, S3 sources disabled: {Error}", httpfsError);
                 if (httpfsOk && s3Sources.Any(s => s.UseCredentialChain) && !TryExec("INSTALL aws; LOAD aws;", out var awsError))
                     logger.LogWarning("Cannot load DuckDB aws extension (credential chain): {Error}", awsError);
+
+                // Caches object metadata (HEAD requests) across queries.
+                if (httpfsOk && q.EnableObjectCache) TryExec("SET enable_http_metadata_cache = true", out _);
 
                 foreach (var src in s3Sources)
                 {

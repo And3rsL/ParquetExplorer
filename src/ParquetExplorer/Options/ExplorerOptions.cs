@@ -83,8 +83,17 @@ public sealed class QueryOptions
     /// <summary>Folder where DuckDB extensions (httpfs) are installed/cached.</summary>
     public string? ExtensionDirectory { get; set; }
 
-    /// <summary>Enable DuckDB's metadata/object cache: speeds up repeated queries on the same files.</summary>
+    /// <summary>
+    /// Cache parquet metadata (footers, row group statistics) and, on S3, object metadata between
+    /// queries: repeated queries on the same files skip re-reading them. Uses a little memory.
+    /// </summary>
     public bool EnableObjectCache { get; set; } = true;
+
+    /// <summary>
+    /// DuckDB's late materialization optimizer. Off by default: with many files it makes
+    /// "SELECT * ... LIMIT n" scan every file twice (26 s instead of 4 s on 190k files).
+    /// </summary>
+    public bool LateMaterialization { get; set; }
 
     /// <summary>Query timeout in seconds (0 = none).</summary>
     public int TimeoutSeconds { get; set; } = 300;

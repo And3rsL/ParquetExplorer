@@ -44,6 +44,8 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
                 COPY (SELECT 1 AS junk) TO '{_root}/crm/_temporary/x.parquet' (FORMAT parquet);
                 COPY (SELECT 42 AS answer) TO '{_root}/lookup.parquet' (FORMAT parquet);
                 COPY (SELECT i AS event_id FROM range(7) t(i)) TO '{_other}/events/e.parquet' (FORMAT parquet);
+                COPY (SELECT i AS n, ['eu','us'][1 + i % 2] AS region, DATE '2024-01-01' + (i % 2)::INT AS day FROM range(20) t(i))
+                  TO '{_root}/logs' (FORMAT parquet, PARTITION_BY (region, day));
                 """;
             cmd.ExecuteNonQuery();
         }
@@ -79,7 +81,7 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
     {
         var src = Assert.Single(_catalog.Sources);
         Assert.Null(src.Error);
-        Assert.Equal(["crm_customers", "lookup", "sales_orders"], src.Tables.Select(t => t.Name).ToArray());
+        Assert.Equal(["crm_customers", "logs", "lookup", "sales_orders"], src.Tables.Select(t => t.Name).ToArray());
 
         var orders = src.Tables.Single(t => t.Name == "sales_orders");
         Assert.True(orders.HivePartitioned);
@@ -88,6 +90,64 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
 
         var customers = src.Tables.Single(t => t.Name == "crm_customers");
         Assert.Equal(2, customers.FileCount); // _temporary is ignored
+    }
+
+    [Fact]
+    public async Task PartitionTypes_AreInferredFromFolderNames()
+    {
+        var orders = _catalog.FindTable("lake", "sales_orders")!;
+        Assert.Equal("BIGINT", orders.PartitionTypes["region"]);
+        // One glob level per partition key instead of "**".
+        Assert.Contains($"region=*{Path.DirectorySeparatorChar}*.parquet", orders.Locations[0]);
+
+        var logs = _catalog.FindTable("lake", "logs")!;
+        Assert.Equal("VARCHAR", logs.PartitionTypes["region"]);
+        Assert.Equal("DATE", logs.PartitionTypes["day"]);
+        Assert.Contains(logs.Columns, c => c.Name == "day" && c.Type == "DATE" && c.IsPartitionKey);
+
+        var exec = await _queries.ExecuteAsync("SELECT count(*) FROM lake.logs WHERE region = 'eu' AND day = DATE '2024-01-01'", 10, Reader);
+        Assert.Null(exec.Error);
+        Assert.Equal("10", exec.ResultSets[0].Rows[0][0]);
+    }
+
+    [Fact]
+    public async Task SelectStarWithLimit_Works()
+    {
+        var exec = await _queries.ExecuteAsync("SELECT * FROM lake.sales_orders LIMIT 5", 100, Reader);
+        Assert.Null(exec.Error);
+        Assert.Equal(5, exec.ResultSets[0].Rows.Count);
+    }
+
+    [Fact]
+    public async Task Refresh_PicksUpNewFilesAndFolders_AndKeepsUnchangedTables()
+    {
+        var customersBefore = _catalog.FindTable("lake", "crm_customers")!;
+        Directory.CreateDirectory(Path.Combine(_root, "sales", "orders", "region=7"));
+        using (var c = new DuckDBConnection("Data Source=:memory:"))
+        {
+            c.Open();
+            using var cmd = c.CreateCommand();
+            cmd.CommandText =
+                $"COPY (SELECT 1000 AS id, 1.5 AS amount) TO '{_root}/sales/orders/region=7/extra.parquet' (FORMAT parquet);" +
+                $"COPY (SELECT 1 AS x) TO '{_root}/crm/new_table.parquet' (FORMAT parquet);";
+            cmd.ExecuteNonQuery();
+        }
+        Directory.CreateDirectory(Path.Combine(_root, "fresh"));
+        File.Copy(Path.Combine(_root, "lookup.parquet"), Path.Combine(_root, "fresh", "f.parquet"));
+
+        await _catalog.RefreshAllAsync();
+
+        var exec = await _queries.ExecuteAsync("SELECT count(*) FROM lake.sales_orders WHERE region = 7; SELECT answer FROM lake.fresh", 10, Reader);
+        Assert.Null(exec.Error);
+        Assert.Equal("1", exec.ResultSets[0].Rows[0][0]);
+        Assert.Equal("42", exec.ResultSets[1].Rows[0][0]);
+        Assert.Equal(4, _catalog.FindTable("lake", "sales_orders")!.FileCount);
+
+        // crm/ now holds a file of its own and becomes a table; crm/customers did not change.
+        Assert.NotNull(_catalog.FindTable("lake", "crm"));
+        var customersAfter = _catalog.FindTable("lake", "crm_customers")!;
+        Assert.Equal(customersBefore.Fingerprint, customersAfter.Fingerprint);
+        Assert.Same(customersBefore.Columns, customersAfter.Columns); // view kept, not rebuilt
     }
 
     [Fact]
