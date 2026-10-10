@@ -1,0 +1,43 @@
+@implements IDisposable
+@inject QueryHistoryService History
+
+<div class="flex h-full flex-col">
+    <div class="flex items-center justify-between px-3 pt-3 pb-2">
+        <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Query history</span>
+        <button class="btn-icon size-7" title="Clear history" @onclick="() => History.Clear(UserName)"><Icon Name="trash" Class="size-3.5" /></button>
+    </div>
+    <div class="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 pb-4">
+        @{ var items = History.Get(UserName); }
+        @if (items.Count == 0)
+        {
+            <div class="px-2 py-6 text-center text-xs text-slate-400">No queries yet</div>
+        }
+        @foreach (var h in items)
+        {
+            <button class="block w-full rounded-lg border border-transparent p-2 text-left hover:border-slate-200 hover:bg-slate-50 dark:hover:border-slate-800 dark:hover:bg-slate-800/50"
+                    title="Open in a new tab" @onclick="() => OnOpen.InvokeAsync(h.Sql)">
+                <div class="line-clamp-3 whitespace-pre-wrap break-all font-mono text-[11.5px] text-slate-700 dark:text-slate-300">@h.Sql.Trim()</div>
+                <div class="mt-1 flex items-center gap-2 text-[10.5px] text-slate-400">
+                    <span class="@(h.Error is null ? "text-emerald-500" : "text-rose-500")">●</span>
+                    <span>@h.At.ToString("HH:mm:ss")</span>
+                    <span>@Format.Duration(h.Elapsed)</span>
+                    @if (h.Error is null) { <span>@h.Rows.ToString("N0") rows</span> }
+                </div>
+            </button>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string UserName { get; set; } = "";
+    [Parameter] public EventCallback<string> OnOpen { get; set; }
+
+    protected override void OnInitialized() => History.Changed += OnChanged;
+
+    private void OnChanged(string user)
+    {
+        if (string.Equals(user, UserName, StringComparison.OrdinalIgnoreCase)) InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => History.Changed -= OnChanged;
+}

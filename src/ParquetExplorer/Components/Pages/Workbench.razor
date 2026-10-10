@@ -1,0 +1,547 @@
+@page "/"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+@inject QueryService Queries
+@inject CatalogService Catalog
+@inject DuckDbEngine Engine
+
+<PageTitle>@(ActiveTab?.Title ?? "Workbench") · Parquet Explorer</PageTitle>
+
+<div class="flex h-screen flex-col overflow-hidden">
+    @* ---------------- Top bar ---------------- *@
+    <header class="relative z-30 flex h-12 shrink-0 items-center gap-2 border-b border-slate-200 bg-white/80 px-3 backdrop-blur dark:border-slate-800 dark:bg-slate-900/80">
+        <div class="mr-2 flex items-center gap-2">
+            <img src="favicon.svg" alt="" class="size-6" />
+            <span class="hidden text-sm font-semibold tracking-tight text-slate-900 sm:inline dark:text-white">Parquet Explorer</span>
+        </div>
+
+        <button class="btn-ghost" @onclick="() => NewTab()" title="New query (Ctrl+Alt+N)"><Icon Name="plus" /> <span class="hidden md:inline">New query</span></button>
+        <div class="mx-1 h-6 w-px bg-slate-200 dark:bg-slate-800"></div>
+
+        @if (ActiveTab?.Running == true)
+        {
+            <button class="btn-danger" @onclick="Cancel"><Icon Name="square" Class="size-3.5" /> Cancel</button>
+        }
+        else
+        {
+            <button class="btn-primary" @onclick="Execute" disabled="@(ActiveTab is null)" title="Execute (F5 / Ctrl+Enter). Runs the selection if any.">
+                <Icon Name="play" Class="size-3.5 fill-current" /> Execute
+            </button>
+        }
+
+        <label class="ml-2 hidden items-center gap-2 text-xs text-slate-500 md:flex">
+            Rows
+            <select class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200" @bind="_rowLimit">
+                @foreach (var l in RowLimits)
+                {
+                    <option value="@l">@l.ToString("N0")</option>
+                }
+            </select>
+        </label>
+
+        <div class="relative">
+            <button class="btn-ghost" @onclick="() => _exportOpen = !_exportOpen" disabled="@(ActiveTab?.LastSql is null || _exporting)" title="Export the full result of the last query">
+                <Icon Name="download" Class="@(_exporting ? "size-4 animate-bounce" : "size-4")" /> <span class="hidden md:inline">Export</span>
+            </button>
+            @if (_exportOpen)
+            {
+                <div class="fixed inset-0 z-40" @onclick="() => _exportOpen = false"></div>
+                <div class="menu left-0 top-10">
+                    <div class="px-3 pt-1.5 pb-1 text-[11px] text-slate-400">Full result, no row limit</div>
+                    <button class="menu-item" @onclick='() => Export("csv")'>CSV <span class="ml-auto text-xs text-slate-400">.csv</span></button>
+                    <button class="menu-item" @onclick='() => Export("parquet")'>Parquet <span class="ml-auto text-xs text-slate-400">.parquet</span></button>
+                    <button class="menu-item" @onclick='() => Export("json")'>JSON lines <span class="ml-auto text-xs text-slate-400">.jsonl</span></button>
+                </div>
+            }
+        </div>
+
+        <div class="ml-auto flex items-center gap-1">
+            <button class="btn-icon" @onclick="ToggleTheme" title="Toggle theme">
+                <Icon Name="@(_dark ? "sun" : "moon")" />
+            </button>
+            <AuthorizeView>
+                <div class="ml-1 hidden items-center gap-2 rounded-lg px-2 py-1 sm:flex">
+                    <div class="grid size-7 place-items-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-xs font-semibold text-white">
+                        @(context.User.Identity?.Name?.FirstOrDefault().ToString().ToUpperInvariant())
+                    </div>
+                    <div class="leading-tight">
+                        <div class="text-xs font-medium">@context.User.FindFirst("display_name")?.Value</div>
+                        <div class="text-[10px] text-slate-400">@(context.User.IsInRole("Admin") ? "Admin" : "Read-only")</div>
+                    </div>
+                </div>
+            </AuthorizeView>
+            <form method="post" action="auth/logout" data-enhance="false">
+                <AntiforgeryToken />
+                <button type="submit" class="btn-icon" title="Sign out"><Icon Name="logout" /></button>
+            </form>
+        </div>
+    </header>
+
+    <div class="flex min-h-0 flex-1">
+        @* ---------------- Sidebar ---------------- *@
+        <aside class="panel flex w-72 shrink-0 flex-col border-r" @ref="_sidebar">
+            <div class="flex gap-1 border-b border-slate-200 p-1.5 dark:border-slate-800">
+                <button class="@SideTabClass(!_showHistory)" @onclick="() => _showHistory = false"><Icon Name="database" Class="size-3.5" /> Explorer</button>
+                <button class="@SideTabClass(_showHistory)" @onclick="() => _showHistory = true"><Icon Name="history" Class="size-3.5" /> History</button>
+            </div>
+            <div class="min-h-0 flex-1">
+                @if (_showHistory)
+                {
+                    <HistoryPanel UserName="@_userName" OnOpen="OpenFromHistory" />
+                }
+                else
+                {
+                    <ObjectExplorer OnTableAction="HandleTableAction" OnInsertText="InsertText" />
+                }
+            </div>
+        </aside>
+        <div class="w-1 shrink-0 cursor-col-resize bg-transparent transition hover:bg-indigo-500/40" @ref="_sidebarHandle"></div>
+
+        @* ---------------- Main area ---------------- *@
+        <main class="flex min-w-0 flex-1 flex-col">
+            @* Tabs *@
+            <div class="flex h-10 shrink-0 items-end gap-0.5 overflow-x-auto border-b border-slate-200 bg-slate-100/60 px-2 pt-1.5 dark:border-slate-800 dark:bg-slate-950">
+                @foreach (var tab in _tabs)
+                {
+                    var active = tab == ActiveTab;
+                    <div class="@TabClass(active)" @onclick="() => Activate(tab)" @onmouseup="e => OnTabMouseUp(e, tab)">
+                        @if (tab.Running)
+                        {
+                            <Icon Name="refresh" Class="size-3 animate-spin text-indigo-500" />
+                        }
+                        else if (tab.Execution?.Error is not null && !tab.Execution.Cancelled)
+                        {
+                            <span class="size-1.5 rounded-full bg-rose-500"></span>
+                        }
+                        else if (tab.Execution is not null)
+                        {
+                            <span class="size-1.5 rounded-full bg-emerald-500"></span>
+                        }
+                        <span class="max-w-40 truncate">@tab.Title</span>
+                        <button class="rounded p-0.5 opacity-50 hover:bg-slate-200 hover:opacity-100 dark:hover:bg-slate-700" @onclick="() => CloseTab(tab)" @onclick:stopPropagation title="Close">
+                            <Icon Name="x" Class="size-3" />
+                        </button>
+                    </div>
+                }
+                <button class="mb-1 ml-1 rounded-md p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200" @onclick="() => NewTab()" title="New query">
+                    <Icon Name="plus" Class="size-4" />
+                </button>
+            </div>
+
+            @* Editors: one per tab, kept alive and hidden when inactive *@
+            <section class="relative shrink-0 bg-white dark:bg-slate-900/40" style="height: 40%; min-height: 80px" @ref="_editorPane">
+                @foreach (var tab in _tabs)
+                {
+                    <div @key="tab.Id" class="@(tab == ActiveTab ? "absolute inset-0" : "hidden")" @ref="tab.EditorElement"></div>
+                }
+                @if (_tabs.Count == 0 && _initialized)
+                {
+                    <div class="flex h-full items-center justify-center">
+                        <button class="btn-primary" @onclick="() => NewTab()"><Icon Name="plus" /> New query</button>
+                    </div>
+                }
+            </section>
+            <div class="relative h-1.5 shrink-0 cursor-row-resize border-y border-slate-200 bg-slate-100 transition hover:bg-indigo-500/40 dark:border-slate-800 dark:bg-slate-900" @ref="_editorHandle">
+                @if (ActiveTab?.Running == true)
+                {
+                    <div class="absolute inset-0 overflow-hidden">
+                        @if (ActiveTab.Progress is double p && p > 0)
+                        {
+                            <div class="h-full bg-indigo-500 transition-all" style="width:@(p.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div>
+                        }
+                        else
+                        {
+                            <div class="px-indeterminate h-full w-1/3 bg-indigo-500"></div>
+                        }
+                    </div>
+                }
+            </div>
+
+            @* Results *@
+            <section class="flex min-h-0 flex-1 flex-col bg-white dark:bg-slate-900/20">
+                @if (ActiveTab is { } at)
+                {
+                    <div class="flex h-9 shrink-0 items-center gap-1 border-b border-slate-200 px-2 dark:border-slate-800">
+                        @if (at.Execution is { } ex)
+                        {
+                            @for (var i = 0; i < ex.ResultSets.Count; i++)
+                            {
+                                var idx = i;
+                                var rs = ex.ResultSets[i];
+                                <button class="@ResultTabClass(at.ResultIndex == idx)" @onclick="() => at.ResultIndex = idx">
+                                    <Icon Name="table" Class="size-3.5" /> Results@(ex.ResultSets.Count > 1 ? $" {idx + 1}" : "")
+                                    @if (rs.Columns.Count > 0)
+                                    {
+                                        <span class="rounded-full bg-slate-200 px-1.5 text-[10px] dark:bg-slate-800">@rs.Rows.Count.ToString("N0")@(rs.Truncated ? "+" : "")</span>
+                                    }
+                                </button>
+                            }
+                            <button class="@ResultTabClass(at.ResultIndex == -1)" @onclick="() => at.ResultIndex = -1">
+                                <Icon Name="message" Class="size-3.5" /> Messages
+                                @if (ex.Error is not null)
+                                {
+                                    <span class="size-1.5 rounded-full bg-rose-500"></span>
+                                }
+                            </button>
+                        }
+                        else
+                        {
+                            <span class="px-2 text-xs text-slate-400">Results</span>
+                        }
+                    </div>
+
+                    <div class="min-h-0 flex-1">
+                        @if (at.Running && at.Execution is null)
+                        {
+                            <div class="flex h-full flex-col items-center justify-center gap-3 text-sm text-slate-500">
+                                <Icon Name="refresh" Class="size-6 animate-spin text-indigo-500" />
+                                <span>Executing… @Format.Duration(DateTimeOffset.Now - at.RunningSince!.Value)@(at.Progress is double p2 && p2 > 0 ? $" · {p2:0}%" : "")</span>
+                            </div>
+                        }
+                        else if (at.Execution is { } ex2)
+                        {
+                            @if (at.ResultIndex >= 0 && at.ResultIndex < ex2.ResultSets.Count)
+                            {
+                                var rs = ex2.ResultSets[at.ResultIndex];
+                                <ResultGrid @key="rs" Result="rs" />
+                            }
+                            else
+                            {
+                                <MessagesPane Execution="ex2" />
+                            }
+                        }
+                        else
+                        {
+                            <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-400">
+                                <Icon Name="database" Class="size-8 text-slate-300 dark:text-slate-700" StrokeWidth="1.5" />
+                                <p>Run a query to see results here.</p>
+                                <p class="text-xs">
+                                    <span class="kbd">F5</span> or <span class="kbd">Ctrl</span>+<span class="kbd">Enter</span> executes ·
+                                    select text to run only that part · right-click a table for scripts
+                                </p>
+                            </div>
+                        }
+                    </div>
+                }
+            </section>
+
+            @* Status bar *@
+            <footer class="flex h-7 shrink-0 items-center gap-4 border-t border-slate-200 bg-indigo-600 px-3 text-[11px] text-indigo-50 dark:border-slate-800 dark:bg-indigo-950 dark:text-indigo-200">
+                @if (ActiveTab is { } st)
+                {
+                    @if (st.Running)
+                    {
+                        <span class="flex items-center gap-1.5"><Icon Name="refresh" Class="size-3 animate-spin" /> Executing query…</span>
+                    }
+                    else if (st.Execution is { } se)
+                    {
+                        @if (se.Error is not null)
+                        {
+                            <span class="flex items-center gap-1.5"><Icon Name="alert" Class="size-3" /> @(se.Cancelled ? "Cancelled" : "Completed with errors")</span>
+                        }
+                        else
+                        {
+                            <span class="flex items-center gap-1.5"><Icon Name="check" Class="size-3" /> Query executed successfully</span>
+                        }
+                    }
+                    else
+                    {
+                        <span>Ready</span>
+                    }
+                }
+                <span class="ml-auto flex items-center gap-1.5"><Icon Name="database" Class="size-3" /> DuckDB @Engine.Version</span>
+                <span class="flex items-center gap-1.5"><Icon Name="user" Class="size-3" /> @_userName</span>
+                @if (ActiveTab?.Execution is { } fe)
+                {
+                    <span class="flex items-center gap-1.5"><Icon Name="clock" Class="size-3" /> @Format.Duration(fe.Elapsed)</span>
+                    <span class="flex items-center gap-1.5"><Icon Name="rows" Class="size-3" /> @fe.TotalRows.ToString("N0") rows@(fe.ResultSets.Any(r => r.Truncated) ? " (limited)" : "")</span>
+                }
+            </footer>
+        </main>
+    </div>
+</div>
+
+@if (_toast is not null)
+{
+    <div class="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-xl border border-rose-500/30 bg-white px-4 py-3 text-sm shadow-xl dark:bg-slate-900">
+        <Icon Name="alert" Class="mt-0.5 size-4 shrink-0 text-rose-500" />
+        <span class="break-words">@_toast</span>
+        <button class="ml-2 text-slate-400 hover:text-slate-700" @onclick="() => _toast = null"><Icon Name="x" Class="size-3.5" /></button>
+    </div>
+}
+
+@code {
+    private static readonly int[] RowLimits = [100, 1_000, 10_000, 50_000, 100_000];
+
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private readonly List<QueryTab> _tabs = [];
+    private QueryTab? ActiveTab { get; set; }
+    private DotNetObjectReference<Workbench>? _selfRef;
+    private ClaimsPrincipal _user = new();
+    private string _userName = "";
+    private int _rowLimit;
+    private bool _initialized, _dark = true, _showHistory, _exportOpen, _exporting;
+    private string? _toast;
+    private int _tabCounter;
+    private ElementReference _sidebar, _sidebarHandle, _editorPane, _editorHandle;
+    private Timer? _ticker;
+
+    private string StorageKey => $"px-tabs:{_userName}";
+
+    protected override async Task OnInitializedAsync()
+    {
+        _user = (await AuthState).User;
+        _userName = _user.Identity?.Name ?? "";
+        _rowLimit = RowLimits.Contains(Queries.DefaultRowLimit) ? Queries.DefaultRowLimit : RowLimits[1];
+        Catalog.Changed += OnCatalogChanged;
+        // Refresh the "Executing… 1.2 s" counters.
+        _ticker = new Timer(_ => { if (_tabs.Any(t => t.Running)) InvokeAsync(StateHasChanged); }, null, 250, 250);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _selfRef = DotNetObjectReference.Create(this);
+            _dark = await JS.InvokeAsync<bool>("pxEditor.isDark");
+            await JS.InvokeVoidAsync("pxEditor.registerShortcuts", _selfRef);
+            await JS.InvokeVoidAsync("pxEditor.registerTabProvider", _selfRef);
+            await JS.InvokeVoidAsync("pxEditor.initSplitter", _sidebarHandle, _sidebar, "x", "px-sidebar", 200, 640);
+            await JS.InvokeVoidAsync("pxEditor.initSplitter", _editorHandle, _editorPane, "y", "px-editor", 80, 2000);
+            await JS.InvokeVoidAsync("pxEditor.setSchema", Catalog.CompletionSchema());
+
+            var saved = await JS.InvokeAsync<string?>("pxEditor.loadTabs", StorageKey);
+            List<SavedTab>? tabs = null;
+            try { tabs = saved is null ? null : System.Text.Json.JsonSerializer.Deserialize<List<SavedTab>>(saved); } catch { }
+            if (tabs is { Count: > 0 })
+                foreach (var t in tabs) NewTab(t.Sql, t.Title, activate: false);
+            else
+                NewTab(WelcomeSql());
+            ActiveTab ??= _tabs.FirstOrDefault();
+            _initialized = true;
+            StateHasChanged();
+            return;
+        }
+
+        // Create CodeMirror instances for newly rendered tabs.
+        foreach (var tab in _tabs.Where(t => t.EditorId is null).ToList())
+        {
+            tab.EditorId = await JS.InvokeAsync<int>("pxEditor.create", tab.EditorElement, _selfRef, tab.InitialSql);
+            if (tab == ActiveTab) await JS.InvokeVoidAsync("pxEditor.focus", tab.EditorId);
+            if (tab.RunOnCreate)
+            {
+                tab.RunOnCreate = false;
+                _ = RunAsync(tab, tab.InitialSql);
+            }
+        }
+    }
+
+    private string WelcomeSql()
+    {
+        var first = Catalog.AllTables.FirstOrDefault(t => t.Error is null);
+        var example = first is null ? "-- SELECT * FROM <source>.<table> LIMIT 100;" : $"SELECT *\nFROM {first.DisplayQualifiedName}\nLIMIT 100;";
+        return "-- Welcome to Parquet Explorer!\n-- Every folder with parquet files is a table: <source>.<folder>.\n" +
+               "-- F5 / Ctrl+Enter runs the query (or just the selected text).\n\n" + example + "\n";
+    }
+
+    // ---------------- Tabs ----------------
+    private QueryTab NewTab(string sql = "", string? title = null, bool activate = true, bool run = false)
+    {
+        var tab = new QueryTab { Title = title ?? $"Query {++_tabCounter}", InitialSql = sql, RunOnCreate = run };
+        if (title is not null) _tabCounter++;
+        _tabs.Add(tab);
+        if (activate) ActiveTab = tab;
+        return tab;
+    }
+
+    private async Task Activate(QueryTab tab)
+    {
+        ActiveTab = tab;
+        if (tab.EditorId is int id) await JS.InvokeVoidAsync("pxEditor.focus", id);
+    }
+
+    private Task OnTabMouseUp(MouseEventArgs e, QueryTab tab) => e.Button == 1 ? CloseTab(tab) : Task.CompletedTask;
+
+    private async Task CloseTab(QueryTab tab)
+    {
+        tab.Cts?.Cancel();
+        if (tab.EditorId is int id) await JS.InvokeVoidAsync("pxEditor.destroy", id);
+        var idx = _tabs.IndexOf(tab);
+        _tabs.Remove(tab);
+        if (ActiveTab == tab) ActiveTab = _tabs.Count == 0 ? null : _tabs[Math.Clamp(idx, 0, _tabs.Count - 1)];
+        await PersistTabs();
+    }
+
+    [JSInvokable]
+    public async Task PersistTabs()
+    {
+        var list = new List<SavedTab>();
+        foreach (var t in _tabs)
+        {
+            var sql = t.EditorId is int id ? await JS.InvokeAsync<string>("pxEditor.getDoc", id) : t.InitialSql;
+            list.Add(new SavedTab(t.Title, sql));
+        }
+        await JS.InvokeVoidAsync("pxEditor.saveTabs", StorageKey, System.Text.Json.JsonSerializer.Serialize(list));
+    }
+
+    [JSInvokable]
+    public async Task NewTabFromShortcut()
+    {
+        NewTab();
+        StateHasChanged();
+        await Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public Task CloseMenus()
+    {
+        if (_exportOpen) { _exportOpen = false; StateHasChanged(); }
+        return Task.CompletedTask;
+    }
+
+    // ---------------- Execution ----------------
+    [JSInvokable]
+    public Task ExecuteFromEditor() => InvokeAsync(Execute);
+
+    private async Task Execute()
+    {
+        var tab = ActiveTab;
+        if (tab?.EditorId is not int id || tab.Running) return;
+        var sql = await JS.InvokeAsync<string>("pxEditor.getRunnableText", id);
+        if (string.IsNullOrWhiteSpace(sql)) return;
+        await RunAsync(tab, sql);
+    }
+
+    private async Task RunAsync(QueryTab tab, string sql)
+    {
+        if (tab.Running) return;
+        tab.Running = true;
+        tab.Progress = null;
+        tab.RunningSince = DateTimeOffset.Now;
+        tab.Execution = null;
+        tab.Cts = new CancellationTokenSource();
+        StateHasChanged();
+
+        try
+        {
+            var exec = await Queries.ExecuteAsync(sql, _rowLimit, _user, p => tab.Progress = p, tab.Cts.Token);
+            tab.Execution = exec;
+            tab.LastSql = exec.Error is null ? sql : tab.LastSql ?? sql;
+            var firstGrid = exec.ResultSets.FindIndex(r => r.Columns.Count > 0);
+            tab.ResultIndex = exec.Error is not null ? -1 : firstGrid >= 0 ? firstGrid : exec.ResultSets.Count > 0 ? 0 : -1;
+        }
+        finally
+        {
+            tab.Running = false;
+            tab.Cts?.Dispose();
+            tab.Cts = null;
+            StateHasChanged();
+        }
+        _ = PersistTabs();
+    }
+
+    private void Cancel() => ActiveTab?.Cts?.Cancel();
+
+    private async Task Export(string format)
+    {
+        _exportOpen = false;
+        if (ActiveTab?.LastSql is not { } sql) return;
+        _exporting = true;
+        StateHasChanged();
+        try
+        {
+            var error = await JS.InvokeAsync<string?>("pxEditor.exportQuery", sql, format);
+            if (error is not null) _toast = "Export failed: " + error;
+        }
+        finally
+        {
+            _exporting = false;
+        }
+    }
+
+    // ---------------- Object explorer actions ----------------
+    private async Task HandleTableAction(TableAction a)
+    {
+        var t = a.Table;
+        var name = t.DisplayQualifiedName.Contains('"') || !IsSimple(t.Schema) || !IsSimple(t.Name) ? t.QualifiedName : t.DisplayQualifiedName;
+        switch (a.Kind)
+        {
+            case TableActionKind.SelectTop:
+                NewTab($"SELECT *\nFROM {name}\nLIMIT 1000;", t.Name, run: true);
+                break;
+            case TableActionKind.Count:
+                NewTab($"SELECT count(*) AS row_count\nFROM {name};", $"count {t.Name}", run: true);
+                break;
+            case TableActionKind.Describe:
+                NewTab($"DESCRIBE {name};", $"describe {t.Name}", run: true);
+                break;
+            case TableActionKind.Summarize:
+                NewTab($"SUMMARIZE {name};", $"summarize {t.Name}", run: true);
+                break;
+            case TableActionKind.Files:
+                var files = t.Locations.Count == 1 ? SqlText.Literal(t.Locations[0]) : "[" + string.Join(", ", t.Locations.Select(SqlText.Literal)) + "]";
+                NewTab($"SELECT file_name, num_rows, num_row_groups, format_version, created_by\nFROM parquet_file_metadata({files})\nORDER BY file_name;", $"files {t.Name}", run: true);
+                break;
+            case TableActionKind.ScriptSelect:
+                var cols = t.Columns.Count == 0 ? "*" : string.Join(",\n       ", t.Columns.Select(c => IsSimple(c.Name) ? c.Name : SqlText.Ident(c.Name)));
+                NewTab($"SELECT {cols}\nFROM {name}\nLIMIT 1000;", t.Name);
+                break;
+            case TableActionKind.InsertName:
+                await InsertText(name);
+                break;
+            case TableActionKind.CopyName:
+                await JS.InvokeAsync<bool>("pxEditor.copyText", name);
+                break;
+        }
+    }
+
+    private static bool IsSimple(string id) => System.Text.RegularExpressions.Regex.IsMatch(id, "^[A-Za-z_][A-Za-z0-9_]*$");
+
+    private async Task InsertText(string text)
+    {
+        if (ActiveTab?.EditorId is int id) await JS.InvokeVoidAsync("pxEditor.insertText", id, text);
+    }
+
+    private Task OpenFromHistory(string sql)
+    {
+        NewTab(sql);
+        _showHistory = false;
+        return Task.CompletedTask;
+    }
+
+    private void OnCatalogChanged() => InvokeAsync(async () =>
+    {
+        try { await JS.InvokeVoidAsync("pxEditor.setSchema", Catalog.CompletionSchema()); } catch { }
+    });
+
+    private async Task ToggleTheme()
+    {
+        _dark = !_dark;
+        await JS.InvokeVoidAsync("pxEditor.setDark", _dark);
+    }
+
+    // ---------------- Styling helpers ----------------
+    private static string TabClass(bool active) => active
+        ? "group flex h-full cursor-pointer select-none items-center gap-1.5 rounded-t-lg border border-b-0 border-slate-200 bg-white px-3 text-[13px] font-medium text-slate-900 dark:border-slate-800 dark:bg-slate-900 dark:text-white"
+        : "group flex h-full cursor-pointer select-none items-center gap-1.5 rounded-t-lg px-3 text-[13px] text-slate-500 hover:bg-slate-200/60 hover:text-slate-800 dark:hover:bg-slate-900/60 dark:hover:text-slate-200";
+
+    private static string ResultTabClass(bool active) => active
+        ? "flex items-center gap-1.5 rounded-md bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-200"
+        : "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800";
+
+    private static string SideTabClass(bool active) => active
+        ? "flex flex-1 items-center justify-center gap-1.5 rounded-md bg-slate-100 py-1 text-xs font-medium text-slate-900 dark:bg-slate-800 dark:text-white"
+        : "flex flex-1 items-center justify-center gap-1.5 rounded-md py-1 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/60";
+
+    public async ValueTask DisposeAsync()
+    {
+        Catalog.Changed -= OnCatalogChanged;
+        _ticker?.Dispose();
+        foreach (var t in _tabs) t.Cts?.Cancel();
+        _selfRef?.Dispose();
+        await Task.CompletedTask;
+    }
+}

@@ -1,0 +1,12 @@
+bin/
+obj/
+node_modules/
+*.user
+.vs/
+.vscode/
+.idea/
+*.swp
+TestResults/
+/data/
+/keys/
+appsettings.Local.json

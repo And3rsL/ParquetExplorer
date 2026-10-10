@@ -1,0 +1,196 @@
+@using System.Globalization
+@using System.Text
+@inject IJSRuntime JS
+
+<div class="flex h-full min-h-0 flex-col">
+    <div class="min-h-0 flex-1 overflow-auto" @ref="_scroller">
+        @if (Result.Columns.Count == 0)
+        {
+            <div class="flex h-full items-center justify-center text-sm text-slate-500">
+                <span class="flex items-center gap-2"><Icon Name="check" Class="size-4 text-emerald-500" />
+                    Statement executed@(Result.RecordsAffected is > 0 ? $" — {Result.RecordsAffected:N0} row(s) affected" : "").</span>
+            </div>
+        }
+        else
+        {
+            <table class="px-grid w-max min-w-full font-mono text-[12.5px]">
+                <thead class="sticky top-0 z-10">
+                    <tr>
+                        <th class="sticky left-0 z-20 w-12 border-r border-b border-slate-200 bg-slate-100 px-2 text-right text-[10.5px] font-normal text-slate-400 dark:border-slate-800 dark:bg-slate-900"></th>
+                        @for (var c = 0; c < Result.Columns.Count; c++)
+                        {
+                            var col = Result.Columns[c];
+                            var ci = c;
+                            <th class="cursor-pointer select-none border-r border-b border-slate-200 bg-slate-100 px-3 text-left font-sans hover:bg-slate-200/70 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800"
+                                title="@($"{col.Name} ({col.Type}) — click to sort")" @onclick="() => SortBy(ci)">
+                                <div class="flex items-center gap-1.5 whitespace-nowrap">
+                                    <span class="text-[12px] font-semibold text-slate-700 dark:text-slate-200">@col.Name</span>
+                                    <span class="text-[10px] font-normal uppercase text-slate-400">@ShortType(col.Type)</span>
+                                    @if (_sortCol == ci)
+                                    {
+                                        <Icon Name="@(_sortDesc ? "arrow-down" : "arrow-up")" Class="size-3 text-indigo-500" />
+                                    }
+                                </div>
+                            </th>
+                        }
+                    </tr>
+                </thead>
+                <tbody>
+                    <Virtualize Items="_order" ItemSize="28" OverscanCount="40" SpacerElement="tr" Context="r">
+                        <tr class="@(_selRow == r ? "bg-indigo-500/10" : "even:bg-slate-50/60 dark:even:bg-white/[0.015]") hover:bg-indigo-500/5">
+                            <td class="sticky left-0 border-r border-b border-slate-200 bg-slate-50 px-2 text-right text-[10.5px] text-slate-400 dark:border-slate-800 dark:bg-slate-900">@(r + 1)</td>
+                            @{ var row = Result.Rows[r]; }
+                            @for (var c = 0; c < row.Length; c++)
+                            {
+                                var ci = c;
+                                var v = row[c];
+                                <td class="@CellClass(r, ci)" @onclick="() => Select(r, ci)">
+                                    @if (v is null)
+                                    {
+                                        <span class="italic text-slate-400/80">NULL</span>
+                                    }
+                                    else
+                                    {
+                                        @Truncate(v)
+                                    }
+                                </td>
+                            }
+                        </tr>
+                    </Virtualize>
+                </tbody>
+            </table>
+        }
+    </div>
+
+    @if (Result.Columns.Count > 0)
+    {
+        <div class="flex h-9 shrink-0 items-center gap-2 border-t border-slate-200 bg-slate-50 px-3 text-xs dark:border-slate-800 dark:bg-slate-900/60">
+            @if (_selRow is int sr && _selCol is int sc)
+            {
+                var value = Result.Rows[sr][sc];
+                <span class="shrink-0 font-semibold text-slate-600 dark:text-slate-300">@Result.Columns[sc].Name</span>
+                <span class="min-w-0 flex-1 truncate font-mono text-slate-500" title="@value">@(value ?? "NULL")</span>
+                <button class="btn-ghost px-2 py-1 text-xs" @onclick="() => Copy(value ?? string.Empty)" title="Copy cell value"><Icon Name="copy" Class="size-3.5" /> Cell</button>
+                <button class="btn-ghost px-2 py-1 text-xs" @onclick="() => Copy(RowTsv(sr))" title="Copy row as TSV"><Icon Name="copy" Class="size-3.5" /> Row</button>
+            }
+            else
+            {
+                <span class="flex-1 text-slate-400">Click a cell to inspect its value · click a header to sort</span>
+            }
+            <button class="btn-ghost px-2 py-1 text-xs" @onclick="CopyAll" title="Copy all loaded rows (TSV, paste into Excel)"><Icon Name="copy" Class="size-3.5" /> All</button>
+            @if (_copied)
+            {
+                <span class="text-emerald-500">Copied!</span>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public ResultSet Result { get; set; } = default!;
+
+    private ElementReference _scroller;
+    private int[] _order = [];
+    private int? _sortCol;
+    private bool _sortDesc;
+    private int? _selRow, _selCol;
+    private bool _copied;
+    private ResultSet? _lastResult;
+
+    protected override void OnParametersSet()
+    {
+        if (ReferenceEquals(_lastResult, Result)) return;
+        _lastResult = Result;
+        _order = Enumerable.Range(0, Result.Rows.Count).ToArray();
+        _sortCol = null;
+        _selRow = _selCol = null;
+    }
+
+    private string CellClass(int r, int c)
+    {
+        var sb = new StringBuilder("max-w-[420px] cursor-default overflow-hidden text-ellipsis whitespace-nowrap border-r border-b border-slate-200/70 px-3 dark:border-slate-800/70");
+        if (Result.Columns[c].IsNumeric) sb.Append(" text-right tabular-nums");
+        if (_selRow == r && _selCol == c) sb.Append(" outline outline-2 -outline-offset-2 outline-indigo-500 bg-indigo-500/10");
+        return sb.ToString();
+    }
+
+    private static string Truncate(string v) => v.Length > 300 ? v[..300] + "…" : v;
+
+    private static string ShortType(string type) => type.Length > 18 ? type[..18] + "…" : type;
+
+    private void Select(int r, int c)
+    {
+        _selRow = r;
+        _selCol = c;
+        _copied = false;
+    }
+
+    private void SortBy(int col)
+    {
+        if (_sortCol == col && _sortDesc)
+        {
+            // Third click restores the original order.
+            _sortCol = null;
+            _order = Enumerable.Range(0, Result.Rows.Count).ToArray();
+            return;
+        }
+        _sortDesc = _sortCol == col;
+        _sortCol = col;
+
+        var rows = Result.Rows;
+        var numeric = Result.Columns[col].IsNumeric;
+        var order = Enumerable.Range(0, rows.Count).ToArray();
+        Comparison<int> cmp;
+        if (numeric)
+        {
+            var keys = rows.Select(r => r[col] is { } s && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : (double?)null).ToArray();
+            cmp = (a, b) => CompareNullable(keys[a], keys[b]);
+        }
+        else
+        {
+            cmp = (a, b) => (rows[a][col], rows[b][col]) switch
+            {
+                (null, null) => 0,
+                (null, _) => 1,
+                (_, null) => -1,
+                var (x, y) => string.CompareOrdinal(x, y),
+            };
+        }
+        // Stable sort, NULLs last in both directions.
+        var desc = _sortDesc;
+        var sorted = order.OrderBy(i => i, Comparer<int>.Create((a, b) =>
+        {
+            var aNull = rows[a][col] is null;
+            var bNull = rows[b][col] is null;
+            if (aNull || bNull) return aNull == bNull ? 0 : aNull ? 1 : -1;
+            return desc ? cmp(b, a) : cmp(a, b);
+        })).ToArray();
+        _order = sorted;
+    }
+
+    private static int CompareNullable(double? a, double? b) => (a, b) switch
+    {
+        (null, null) => 0,
+        (null, _) => 1,
+        (_, null) => -1,
+        _ => a!.Value.CompareTo(b!.Value),
+    };
+
+    private string RowTsv(int r) => string.Join('\t', Result.Rows[r].Select(EscapeTsv));
+
+    private static string EscapeTsv(string? v) =>
+        v is null ? "" : v.Contains('\t') || v.Contains('\n') || v.Contains('"') ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
+
+    private async Task CopyAll()
+    {
+        var sb = new StringBuilder();
+        sb.AppendJoin('\t', Result.Columns.Select(c => EscapeTsv(c.Name))).Append('\n');
+        foreach (var r in _order) sb.Append(RowTsv(r)).Append('\n');
+        await Copy(sb.ToString());
+    }
+
+    private async Task Copy(string text)
+    {
+        _copied = await JS.InvokeAsync<bool>("pxEditor.copyText", text);
+    }
+}
