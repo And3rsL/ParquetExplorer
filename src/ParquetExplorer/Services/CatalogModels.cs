@@ -19,6 +19,12 @@ public sealed class TableInfo
     public bool IsSingleFile { get; init; }
     public bool HivePartitioned { get; init; }
     public IReadOnlyList<string> PartitionKeys { get; init; } = [];
+
+    /// <summary>DuckDB type of each partition key, inferred from the folder names during the scan.</summary>
+    public IReadOnlyDictionary<string, string> PartitionTypes { get; init; } = new Dictionary<string, string>();
+
+    /// <summary>Changes when files are added, removed or rewritten: unchanged tables are not rebuilt on refresh.</summary>
+    public string Fingerprint { get; init; } = "";
     public int FileCount { get; init; }
     public long? TotalBytes { get; init; }
     public IReadOnlyList<ColumnInfo> Columns { get; set; } = [];

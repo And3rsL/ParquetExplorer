@@ -107,7 +107,8 @@ es. `ParquetExplorer__DataSources__0__Path=/data`).
       "TempDirectory": "/var/tmp/px",      // spill su disco per join/sort enormi + export
       "ExtensionDirectory": "",            // dove DuckDB installa httpfs (S3)
       "TimeoutSeconds": 300,
-      "EnableObjectCache": true            // cache dei metadata parquet tra query
+      "EnableObjectCache": true,           // cache dei metadati parquet (e S3) tra query
+      "LateMaterialization": false         // ottimizzatore DuckDB lento con molti file (vedi Prestazioni)
     },
     "Auth": {
       "SessionHours": 12,
@@ -150,6 +151,32 @@ Copia l'hash in `PasswordHash` dell'utente in `Auth:Users` (o nella variabile
 
 Ogni tabella è una vista DuckDB su `read_parquet(...)`: i filtri sulle colonne di partizione
 saltano intere cartelle, e solo le colonne usate vengono lette dai file.
+
+## Prestazioni con molti file
+
+Lo scan **non legge i dati**: elenca i file, poi per ogni tabella crea una vista; DuckDB legge solo il
+footer di un file per lo schema. Accorgimenti per cartelle con decine di migliaia di file:
+
+- tipi delle colonne di partizione ricavati dai nomi delle cartelle (`hive_types`), senza auto-detect;
+- glob con un livello per chiave (`year=*/month=*/*.parquet`) invece di `**`;
+- viste create in parallelo, colonne lette dal catalogo DuckDB;
+- refresh incrementale: le tabelle i cui file non sono cambiati non vengono ricreate;
+- all'avvio ogni sorgente è interrogabile appena pronta, senza aspettare le altre;
+- `parquet_metadata_cache` attiva e late materialization disattivata.
+
+Misure su una tabella da **190.000 file** (disco locale):
+
+| | Prima | Ora |
+|---|---|---|
+| Scan iniziale | 14,6 s | 4,2 s |
+| Refresh periodico | 13,8 s | 1,7 s |
+| Query su una partizione | 11,4 s | 5,9 s |
+| `SELECT * … LIMIT 100` | 29,7 s | 3,9 s |
+
+Il tempo che resta è soprattutto un costo fisso per query: DuckDB rielenca e prepara tutti i file della
+tabella a ogni esecuzione, anche quando il filtro tocca una sola partizione. Cresce con il **numero** di file,
+non con i GB: compattare in file da 128 MB–1 GB lo riduce in proporzione. Su S3 ogni elenco costa una
+richiesta LIST ogni 1.000 file.
 
 ## Sicurezza
 
