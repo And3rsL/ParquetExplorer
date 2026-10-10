@@ -54,6 +54,8 @@ public sealed class DataSourceOptions
     /// <summary>File extensions considered parquet.</summary>
     public string[] Extensions { get; set; } = [".parquet", ".parq", ".pq"];
 
+    public DataSourceOptions Clone() => (DataSourceOptions)MemberwiseClone();
+
     public string RootUri => Type switch
     {
         DataSourceType.S3 => $"s3://{Bucket}/{(string.IsNullOrWhiteSpace(Prefix) ? "" : Prefix.Trim('/') + "/")}",
@@ -100,8 +102,14 @@ public sealed class UserOptions
 
     public string? DisplayName { get; set; }
 
-    /// <summary>"Admin" allows non read-only statements (CREATE VIEW, COPY, ...).</summary>
+    /// <summary>"Admin" allows non read-only statements (CREATE VIEW, COPY, ...) and the admin pages.</summary>
     public string[] Roles { get; set; } = [];
+}
+
+public static class Roles
+{
+    public const string Admin = "Admin";
+    public const string Viewer = "Viewer";
 }
 
 public sealed class AuthOptions
@@ -117,9 +125,27 @@ public sealed class AuthOptions
     public int LockoutMinutes { get; set; } = 5;
 }
 
+public sealed class SourceManagementOptions
+{
+    /// <summary>
+    /// When not empty, sources added from the UI must point inside one of these local folders
+    /// (e.g. ["/data"]). Empty = any folder readable by the server process.
+    /// </summary>
+    public string[] AllowedLocalRoots { get; set; } = [];
+}
+
 public sealed class ExplorerOptions
 {
     public const string Section = "ParquetExplorer";
+
+    /// <summary>
+    /// Folder for data managed from the UI (users.json, sources.json) and, unless
+    /// DataProtectionKeysPath is set, the keys protecting cookies and stored S3 secrets.
+    /// Relative paths are resolved against the content root.
+    /// </summary>
+    public string StateDirectory { get; set; } = "App_Data";
+
+    public SourceManagementOptions SourceManagement { get; set; } = new();
 
     public List<DataSourceOptions> DataSources { get; set; } = [];
 

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using ParquetExplorer.Options;
@@ -13,36 +12,22 @@ namespace ParquetExplorer.Services;
 public sealed partial class CatalogService
 {
     private readonly DuckDbEngine _engine;
-    private readonly ExplorerOptions _options;
+    private readonly SourceRegistry _registry;
     private readonly ILogger<CatalogService> _logger;
-    private readonly ConcurrentDictionary<string, SourceInfo> _sources = new(StringComparer.OrdinalIgnoreCase);
-    private readonly SemaphoreSlim _ddlLock = new(1, 1);
+    private readonly SemaphoreSlim _lock = new(1, 1);
+    private volatile IReadOnlyList<SourceInfo> _sources = [];
 
     public event Action? Changed;
 
-    public CatalogService(DuckDbEngine engine, IOptions<ExplorerOptions> options, ILogger<CatalogService> logger)
+    public CatalogService(DuckDbEngine engine, SourceRegistry registry, ILogger<CatalogService> logger)
     {
         _engine = engine;
-        _options = options.Value;
+        _registry = registry;
         _logger = logger;
-
-        var usedSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "main", "information_schema", "pg_catalog", "temp" };
-        foreach (var src in _options.DataSources)
-        {
-            var schema = Unique(SqlText.ToIdentifier(src.Name), usedSchemas);
-            _sources[src.Name] = new SourceInfo
-            {
-                Name = src.Name,
-                Schema = schema,
-                Type = src.Type,
-                RootUri = src.RootUri,
-                Loading = true,
-            };
-        }
+        _sources = CreateInfos(registry.AllOptions);
     }
 
-    public IReadOnlyList<SourceInfo> Sources =>
-        _options.DataSources.Select(s => _sources[s.Name]).ToList();
+    public IReadOnlyList<SourceInfo> Sources => _sources;
 
     public IEnumerable<TableInfo> AllTables => Sources.SelectMany(s => s.Tables);
 
@@ -56,27 +41,128 @@ public sealed partial class CatalogService
             s => s.Schema,
             s => s.Tables.ToDictionary(t => t.Name, t => t.Columns.Select(c => c.Name).ToArray()));
 
-    public async Task RefreshAllAsync(CancellationToken ct = default)
+    private static List<SourceInfo> CreateInfos(IReadOnlyList<DataSourceOptions> sources)
     {
-        await Task.WhenAll(_options.DataSources.Select(s => RefreshAsync(s.Name, ct)));
+        var usedSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "main", "information_schema", "pg_catalog", "temp", "system" };
+        return sources.Select(src => new SourceInfo
+        {
+            Name = src.Name,
+            Schema = Unique(SqlText.ToIdentifier(src.Name), usedSchemas),
+            Type = src.Type,
+            RootUri = src.RootUri,
+            Options = src,
+            Loading = true,
+        }).ToList();
     }
 
+    /// <summary>
+    /// Rebuilds the whole catalog on a fresh sandboxed database (needed when sources are added,
+    /// changed or removed) and switches to it atomically. Running queries finish on the old one.
+    /// </summary>
+    public async Task ReloadAsync(CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var options = _registry.AllOptions;
+            var infos = CreateInfos(options);
+            // Keep showing the previous tables while loading, mark everything as loading.
+            foreach (var info in infos)
+                info.Tables = _sources.FirstOrDefault(o => o.Name.Equals(info.Name, StringComparison.OrdinalIgnoreCase))?.Tables ?? [];
+            _sources = infos;
+            Changed?.Invoke();
+
+            var instance = await Task.Run(() => _engine.Build(options), ct);
+            try
+            {
+                await Task.WhenAll(infos.Select(i => LoadSourceAsync(i, instance, ct)));
+            }
+            catch
+            {
+                instance.Dispose();
+                throw;
+            }
+            _engine.Activate(instance);
+        }
+        finally
+        {
+            _lock.Release();
+            Changed?.Invoke();
+        }
+    }
+
+    /// <summary>Re-scans every source for new or removed folders (same database).</summary>
+    public async Task RefreshAllAsync(CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var instance = _engine.Current;
+            foreach (var i in _sources) i.Loading = true;
+            Changed?.Invoke();
+            await Task.WhenAll(_sources.Select(i => LoadSourceAsync(i, instance, ct)));
+        }
+        finally
+        {
+            _lock.Release();
+            Changed?.Invoke();
+        }
+    }
+
+    /// <summary>Re-scans one source for new or removed folders (same database).</summary>
     public async Task RefreshAsync(string sourceName, CancellationToken ct = default)
     {
-        var opts = _options.DataSources.First(s => s.Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase));
-        var info = _sources[opts.Name];
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var info = _sources.FirstOrDefault(s => s.Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase));
+            if (info is null) return;
+            info.Loading = true;
+            Changed?.Invoke();
+            await LoadSourceAsync(info, _engine.Current, ct);
+        }
+        finally
+        {
+            _lock.Release();
+            Changed?.Invoke();
+        }
+    }
+
+    public sealed record TestResult(bool Success, string Message, int Tables = 0, int Files = 0, IReadOnlyList<string>? SampleTables = null);
+
+    /// <summary>Checks that a (not yet saved) source is reachable and lists the tables it would expose.</summary>
+    public async Task<TestResult> TestAsync(DataSourceOptions src, CancellationToken ct = default)
+    {
+        try
+        {
+            using var instance = await Task.Run(() => _engine.Build([src]), ct);
+            if (instance.GetSourceError(src.Name) is { } err) return new TestResult(false, err);
+            var files = await Task.Run(() => ListFiles(src, instance), ct);
+            var tables = BuildTables(src, "test", files);
+            return new TestResult(true,
+                files.Count == 0 ? "Connected, but no parquet files were found." : $"Connected: {tables.Count} table(s) from {files.Count} file(s).",
+                tables.Count, files.Count, tables.Select(t => t.Name).Take(12).ToList());
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new TestResult(false, ex.Message);
+        }
+    }
+
+    private async Task LoadSourceAsync(SourceInfo info, EngineInstance instance, CancellationToken ct)
+    {
+        var opts = info.Options;
         info.Loading = true;
-        Changed?.Invoke();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var engineError = _engine.GetSourceError(opts.Name);
+            var engineError = instance.GetSourceError(opts.Name);
             if (engineError is not null) throw new InvalidOperationException(engineError);
 
-            var files = await Task.Run(() => ListFiles(opts), ct);
+            var files = await Task.Run(() => ListFiles(opts, instance), ct);
             var tables = BuildTables(opts, info.Schema, files);
-            await DescribeTablesAsync(opts, tables, ct);
-            await CreateViewsAsync(info, tables, ct);
+            await DescribeTablesAsync(opts, tables, instance, ct);
+            await Task.Run(() => CreateViews(info, tables, instance), ct);
 
             info.Tables = tables.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase).ToList();
             info.Error = null;
@@ -85,8 +171,9 @@ public sealed partial class CatalogService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Cannot load source {Source}", opts.Name);
+            _logger.LogError("Cannot load source {Source}: {Error}", opts.Name, ex.Message);
             info.Error = ex.Message;
+            info.Tables = [];
         }
         finally
         {
@@ -99,7 +186,7 @@ public sealed partial class CatalogService
 
     private sealed record FileEntry(string Uri, string Relative, long? Size);
 
-    private List<FileEntry> ListFiles(DataSourceOptions src)
+    private static List<FileEntry> ListFiles(DataSourceOptions src, EngineInstance instance)
     {
         var exts = src.Extensions.Select(e => e.StartsWith('.') ? e : "." + e).ToArray();
         bool IsParquet(string path) => exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase));
@@ -123,7 +210,7 @@ public sealed partial class CatalogService
 
         // S3: let DuckDB (httpfs) list the bucket, so it shares credentials and endpoint settings.
         var rootUri = src.RootUri;
-        using var conn = _engine.OpenConnection();
+        using var conn = instance.OpenConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = string.Join(" UNION ALL ",
             exts.Select(e => $"SELECT file FROM glob({SqlText.Literal(rootUri + "**/*" + e)})"));
@@ -146,7 +233,7 @@ public sealed partial class CatalogService
     [GeneratedRegex(@"^[^=/]+=[^/]*$")]
     private static partial Regex PartitionSegment();
 
-    private List<TableInfo> BuildTables(DataSourceOptions src, string schema, List<FileEntry> files)
+    private static List<TableInfo> BuildTables(DataSourceOptions src, string schema, List<FileEntry> files)
     {
         var tables = new List<TableInfo>();
         var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -229,7 +316,7 @@ public sealed partial class CatalogService
     }
 
     /// <summary>Reads table schemas in parallel (only parquet footers are touched).</summary>
-    private async Task DescribeTablesAsync(DataSourceOptions src, List<TableInfo> tables, CancellationToken ct)
+    private static async Task DescribeTablesAsync(DataSourceOptions src, List<TableInfo> tables, EngineInstance instance, CancellationToken ct)
     {
         var parallelism = src.Type == DataSourceType.S3 ? 16 : Math.Max(4, Environment.ProcessorCount);
         await Parallel.ForEachAsync(tables, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
@@ -237,7 +324,7 @@ public sealed partial class CatalogService
             {
                 try
                 {
-                    using var conn = _engine.OpenConnection();
+                    using var conn = instance.OpenConnection();
                     using var cmd = conn.CreateCommand();
                     cmd.CommandText = $"DESCRIBE SELECT * FROM {ReadParquetExpr(src, t)}";
                     using var r = cmd.ExecuteReader();
@@ -257,50 +344,41 @@ public sealed partial class CatalogService
             });
     }
 
-    private async Task CreateViewsAsync(SourceInfo info, List<TableInfo> tables, CancellationToken ct)
+    private static void CreateViews(SourceInfo info, List<TableInfo> tables, EngineInstance instance)
     {
-        var src = _options.DataSources.First(s => s.Name == info.Name);
-        await _ddlLock.WaitAsync(ct);
-        try
+        var src = info.Options;
+        using var conn = instance.OpenConnection();
+        void Exec(string sql)
         {
-            using var conn = _engine.OpenConnection();
-            void Exec(string sql)
-            {
-                using var cmd = conn.CreateCommand();
-                cmd.CommandText = sql;
-                cmd.ExecuteNonQuery();
-            }
-
-            Exec($"CREATE SCHEMA IF NOT EXISTS {SqlText.Ident(info.Schema)}");
-
-            // Drop views of tables that disappeared.
-            var existing = new List<string>();
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = $"SELECT view_name FROM duckdb_views() WHERE schema_name = {SqlText.Literal(info.Schema)} AND NOT internal";
-                using var r = cmd.ExecuteReader();
-                while (r.Read()) existing.Add(r.GetString(0));
-            }
-            var keep = tables.Where(t => t.Error is null).Select(t => t.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var v in existing.Where(v => !keep.Contains(v)))
-                Exec($"DROP VIEW IF EXISTS {SqlText.Qualified(info.Schema, v)}");
-
-            foreach (var t in tables.Where(t => t.Error is null))
-            {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    Exec($"CREATE OR REPLACE VIEW {t.QualifiedName} AS SELECT * FROM {ReadParquetExpr(src, t)}");
-                }
-                catch (Exception ex)
-                {
-                    t.Error = ex.Message;
-                }
-            }
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
         }
-        finally
+
+        Exec($"CREATE SCHEMA IF NOT EXISTS {SqlText.Ident(info.Schema)}");
+
+        // Drop views of tables that disappeared.
+        var existing = new List<string>();
+        using (var cmd = conn.CreateCommand())
         {
-            _ddlLock.Release();
+            cmd.CommandText = $"SELECT view_name FROM duckdb_views() WHERE schema_name = {SqlText.Literal(info.Schema)} AND NOT internal";
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) existing.Add(r.GetString(0));
+        }
+        var keep = tables.Where(t => t.Error is null).Select(t => t.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var v in existing.Where(v => !keep.Contains(v)))
+            Exec($"DROP VIEW IF EXISTS {SqlText.Qualified(info.Schema, v)}");
+
+        foreach (var t in tables.Where(t => t.Error is null))
+        {
+            try
+            {
+                Exec($"CREATE OR REPLACE VIEW {t.QualifiedName} AS SELECT * FROM {ReadParquetExpr(src, t)}");
+            }
+            catch (Exception ex)
+            {
+                t.Error = ex.Message;
+            }
         }
     }
 
@@ -317,7 +395,7 @@ public sealed class CatalogRefreshService(CatalogService catalog, IOptions<Explo
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await catalog.RefreshAllAsync(stoppingToken);
+        await catalog.ReloadAsync(stoppingToken);
         var minutes = options.Value.CatalogRefreshMinutes;
         if (minutes <= 0) return;
 

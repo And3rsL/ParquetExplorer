@@ -16,6 +16,16 @@
     </div>
 
     <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-4">
+        @if (Catalog.Sources.Count == 0)
+        {
+            <div class="mx-2 mt-2 rounded-xl border border-dashed border-slate-300 p-4 text-center text-xs text-slate-500 dark:border-slate-700">
+                <Icon Name="database" Class="mx-auto mb-2 size-6 text-slate-400" />
+                No data sources configured.
+                <AuthorizeView Roles="@Roles.Admin">
+                    <a href="admin/sources" class="mt-2 block font-medium text-indigo-600 hover:underline dark:text-indigo-400">Add a data source</a>
+                </AuthorizeView>
+            </div>
+        }
         @foreach (var src in Catalog.Sources)
         {
             var expanded = !_collapsedSources.Contains(src.Name);

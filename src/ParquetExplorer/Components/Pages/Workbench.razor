@@ -58,6 +58,11 @@
         </div>
 
         <div class="ml-auto flex items-center gap-1">
+            <AuthorizeView Roles="@Roles.Admin">
+                <a href="admin/sources" class="btn-ghost" title="Manage data sources"><Icon Name="database" /> <span class="hidden lg:inline">Sources</span></a>
+                <a href="admin/users" class="btn-ghost" title="Manage users"><Icon Name="users" /> <span class="hidden lg:inline">Users</span></a>
+                <div class="mx-1 h-6 w-px bg-slate-200 dark:bg-slate-800"></div>
+            </AuthorizeView>
             <button class="btn-icon" @onclick="ToggleTheme" title="Toggle theme">
                 <Icon Name="@(_dark ? "sun" : "moon")" />
             </button>
@@ -68,7 +73,7 @@
                     </div>
                     <div class="leading-tight">
                         <div class="text-xs font-medium">@context.User.FindFirst("display_name")?.Value</div>
-                        <div class="text-[10px] text-slate-400">@(context.User.IsInRole("Admin") ? "Admin" : "Read-only")</div>
+                        <div class="text-[10px] text-slate-400">@(context.User.IsInRole(Roles.Admin) ? "Admin" : "Viewer")</div>
                     </div>
                 </div>
             </AuthorizeView>

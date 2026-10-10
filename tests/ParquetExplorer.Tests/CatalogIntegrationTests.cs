@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using DuckDB.NET.Data;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Logging.Abstractions;
 using ParquetExplorer.Options;
 using ParquetExplorer.Services;
@@ -10,20 +11,27 @@ namespace ParquetExplorer.Tests;
 /// <summary>End-to-end: writes a small lake to disk, discovers it and queries it through the sandboxed engine.</summary>
 public sealed class CatalogIntegrationTests : IAsyncLifetime
 {
-    private readonly string _root = Path.Combine(Path.GetTempPath(), "px-tests-" + Guid.NewGuid().ToString("N"));
+    private readonly string _root = TempDir.Create();
+    private readonly string _other = TempDir.Create();
+    private readonly string _state = TempDir.Create();
+    private ExplorerOptions _options = default!;
     private DuckDbEngine _engine = default!;
+    private SourceRegistry _registry = default!;
     private CatalogService _catalog = default!;
     private QueryService _queries = default!;
+    private UserStore _users = default!;
 
-    private static readonly ClaimsPrincipal Reader = new(new ClaimsIdentity([new Claim(ClaimTypes.Name, "reader")], "test"));
-    private static readonly ClaimsPrincipal Admin = new(new ClaimsIdentity(
-        [new Claim(ClaimTypes.Name, "admin"), new Claim(ClaimTypes.Role, "Admin")], "test"));
+    private static readonly ClaimsPrincipal Reader = Principal("reader");
+    private static readonly ClaimsPrincipal Admin = Principal("admin");
+
+    private static ClaimsPrincipal Principal(string name) => new(new ClaimsIdentity([new Claim(ClaimTypes.Name, name)], "test"));
 
     public async Task InitializeAsync()
     {
         Directory.CreateDirectory(Path.Combine(_root, "sales", "orders"));
         Directory.CreateDirectory(Path.Combine(_root, "crm", "customers"));
         Directory.CreateDirectory(Path.Combine(_root, "crm", "_temporary"));
+        Directory.CreateDirectory(Path.Combine(_other, "events"));
         using (var c = new DuckDBConnection("Data Source=:memory:"))
         {
             c.Open();
@@ -35,25 +43,34 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
                 COPY (SELECT i AS id, 'c' || i AS name FROM range(10, 15) t(i)) TO '{_root}/crm/customers/part-1.parquet' (FORMAT parquet);
                 COPY (SELECT 1 AS junk) TO '{_root}/crm/_temporary/x.parquet' (FORMAT parquet);
                 COPY (SELECT 42 AS answer) TO '{_root}/lookup.parquet' (FORMAT parquet);
+                COPY (SELECT i AS event_id FROM range(7) t(i)) TO '{_other}/events/e.parquet' (FORMAT parquet);
                 """;
             cmd.ExecuteNonQuery();
         }
 
-        var options = MsOptions.Create(new ExplorerOptions
+        _options = new ExplorerOptions
         {
+            StateDirectory = _state,
             DataSources = [new DataSourceOptions { Name = "lake", Type = DataSourceType.Local, Path = _root }],
-            Query = new QueryOptions { TempDirectory = Path.Combine(_root, ".tmp"), TimeoutSeconds = 30 },
-        });
+            Query = new QueryOptions { TempDirectory = Path.Combine(_state, "tmp"), TimeoutSeconds = 30 },
+            Auth = new AuthOptions { Users = [new UserOptions { Username = "admin", PasswordHash = UserStore.HashPassword("x"), Roles = [Roles.Admin] }] },
+        };
+        var options = MsOptions.Create(_options);
+        _users = new UserStore(new StaticMonitor(_options), NullLogger<UserStore>.Instance);
+        _users.Create("reader", null, "password1", isAdmin: false, by: "admin");
         _engine = new DuckDbEngine(options, NullLogger<DuckDbEngine>.Instance);
-        _catalog = new CatalogService(_engine, options, NullLogger<CatalogService>.Instance);
-        _queries = new QueryService(_engine, new QueryHistoryService(options), options, NullLogger<QueryService>.Instance);
-        await _catalog.RefreshAllAsync();
+        _registry = new SourceRegistry(options, new EphemeralDataProtectionProvider(), NullLogger<SourceRegistry>.Instance);
+        _catalog = new CatalogService(_engine, _registry, NullLogger<CatalogService>.Instance);
+        _queries = new QueryService(_engine, new QueryHistoryService(options), _users, options, NullLogger<QueryService>.Instance);
+        await _catalog.ReloadAsync();
     }
 
     public Task DisposeAsync()
     {
         _engine.Dispose();
-        try { Directory.Delete(_root, recursive: true); } catch { }
+        TempDir.Delete(_root);
+        TempDir.Delete(_other);
+        TempDir.Delete(_state);
         return Task.CompletedTask;
     }
 
@@ -98,7 +115,7 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task Sandbox_BlocksFilesOutsideDataSources()
     {
-        var exec = await _queries.ExecuteAsync("SELECT * FROM read_csv('/etc/hostname')", 10, Admin);
+        var exec = await _queries.ExecuteAsync($"SELECT * FROM read_parquet('{_other}/events/e.parquet')", 10, Admin);
         Assert.NotNull(exec.Error);
         var locked = await _queries.ExecuteAsync("SET enable_external_access = true", 10, Admin);
         Assert.NotNull(locked.Error);
@@ -114,10 +131,92 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PromotedUser_GetsWriteAccess_DisabledUser_IsBlocked()
+    {
+        _users.SetRole("reader", true, "admin");
+        var promoted = await _queries.ExecuteAsync("CREATE TEMP TABLE p AS SELECT 1", 10, Reader);
+        Assert.Null(promoted.Error);
+
+        _users.SetDisabled("reader", true, "admin");
+        var blocked = await _queries.ExecuteAsync("SELECT 1", 10, Reader);
+        Assert.Contains("disabled", blocked.Error);
+    }
+
+    [Fact]
     public async Task Cancellation_StopsLongQueries()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         var exec = await _queries.ExecuteAsync("SELECT count(*) FROM range(1000000000000)", 10, Reader, cancellationToken: cts.Token);
         Assert.True(exec.Cancelled);
+    }
+
+    [Fact]
+    public async Task AddingASource_ReloadsTheSandboxWithoutRestart()
+    {
+        var newSource = new DataSourceOptions { Name = "events", Type = DataSourceType.Local, Path = _other };
+        Assert.Null(_registry.Validate(newSource, null));
+
+        var test = await _catalog.TestAsync(newSource);
+        Assert.True(test.Success, test.Message);
+        Assert.Equal(1, test.Tables);
+
+        _registry.Save(newSource, null, "admin");
+        await _catalog.ReloadAsync();
+
+        var exec = await _queries.ExecuteAsync("SELECT count(*) FROM events.events", 10, Reader);
+        Assert.Null(exec.Error);
+        Assert.Equal("7", exec.ResultSets[0].Rows[0][0]);
+
+        // Removing it closes access to the folder again.
+        _registry.Delete("events", "admin");
+        await _catalog.ReloadAsync();
+        var after = await _queries.ExecuteAsync($"SELECT count(*) FROM read_parquet('{_other}/events/e.parquet')", 10, Admin);
+        Assert.NotNull(after.Error);
+        Assert.DoesNotContain(_catalog.Sources, s => s.Name == "events");
+    }
+
+    [Fact]
+    public void SourceValidation_RejectsBadInput()
+    {
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "lake", Type = DataSourceType.Local, Path = _other }, null)); // duplicate
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "1bad", Type = DataSourceType.Local, Path = _other }, null));
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "main", Type = DataSourceType.Local, Path = _other }, null));
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.Local, Path = "relative/path" }, null));
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.Local, Path = "/does/not/exist" }, null));
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.S3 }, null)); // no bucket
+        Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.S3, Bucket = "b", AccessKeyId = "k" }, null)); // key without secret
+    }
+
+    [Fact]
+    public void AllowedLocalRoots_AreEnforced()
+    {
+        _options.SourceManagement.AllowedLocalRoots = [_root];
+        try
+        {
+            Assert.NotNull(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.Local, Path = _other }, null));
+            Assert.Null(_registry.Validate(new DataSourceOptions { Name = "x", Type = DataSourceType.Local, Path = Path.Combine(_root, "crm") }, null));
+        }
+        finally
+        {
+            _options.SourceManagement.AllowedLocalRoots = [];
+        }
+    }
+
+    [Fact]
+    public void S3Secrets_AreEncryptedOnDisk()
+    {
+        var s3 = new DataSourceOptions { Name = "bucket", Type = DataSourceType.S3, Bucket = "my-bucket", AccessKeyId = "AKIAEXAMPLE", SecretAccessKey = "super-secret-value" };
+        Assert.Null(_registry.Validate(s3, null));
+        _registry.Save(s3, null, "admin");
+        try
+        {
+            var json = File.ReadAllText(Path.Combine(_state, "sources.json"));
+            Assert.DoesNotContain("super-secret-value", json);
+            Assert.Equal("super-secret-value", _registry.Find("bucket")!.Options.SecretAccessKey);
+        }
+        finally
+        {
+            _registry.Delete("bucket", "admin");
+        }
     }
 }

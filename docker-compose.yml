@@ -6,13 +6,14 @@ services:
       - "8080:8080"
     volumes:
       - ./samples:/data:ro            # local folder exposed as source "data"
-      - px-keys:/keys                  # keeps sessions valid across restarts
+      - px-state:/state                # users, sources added from the UI, encryption keys
     environment:
-      # Users: generate a hash with  docker compose run --rm parquet-explorer hash-password 'MyPassword'
+      # Initial admin (other users are created from the Users page).
+      # Generate the hash with:  docker compose run --rm parquet-explorer hash-password 'MyPassword'
       ParquetExplorer__Auth__Users__0__Username: admin
       ParquetExplorer__Auth__Users__0__PasswordHash: "${PX_ADMIN_HASH:?set PX_ADMIN_HASH (see README)}"
       ParquetExplorer__Auth__Users__0__Roles__0: Admin
-      # Second source: S3 bucket on MinIO
+      # Second source: S3 bucket on MinIO (sources can also be added from the Data sources page)
       ParquetExplorer__DataSources__1__Name: lake
       ParquetExplorer__DataSources__1__Type: S3
       ParquetExplorer__DataSources__1__Bucket: lake
@@ -38,5 +39,5 @@ services:
       - minio-data:/data
 
 volumes:
-  px-keys:
+  px-state:
   minio-data:

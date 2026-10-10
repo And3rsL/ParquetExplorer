@@ -1,0 +1,304 @@
+@page "/admin/users"
+@attribute [Authorize(Roles = Roles.Admin)]
+@rendermode InteractiveServer
+@implements IDisposable
+@inject UserStore Store
+
+<PageTitle>Users · Parquet Explorer</PageTitle>
+
+<AdminShell Title="Users"
+            Description="Viewers can run read-only queries. Admins can also run any statement and manage data sources and users.">
+    <Actions>
+        <button class="btn-primary" @onclick="OpenNew"><Icon Name="plus" /> Add user</button>
+    </Actions>
+    <ChildContent>
+        @if (_message is not null)
+        {
+            <div class="@($"mb-4 flex items-start gap-2 rounded-xl border px-4 py-3 text-sm {(_messageIsError ? "border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-300" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300")}")">
+                <Icon Name="@(_messageIsError ? "alert" : "check")" Class="mt-0.5 size-4 shrink-0" />
+                <span class="flex-1">@_message</span>
+                <button class="opacity-60 hover:opacity-100" @onclick="() => _message = null"><Icon Name="x" Class="size-3.5" /></button>
+            </div>
+        }
+
+        <div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <table class="w-full text-sm">
+                <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wider text-slate-500 dark:border-slate-800 dark:bg-slate-900/60">
+                    <tr>
+                        <th class="px-4 py-3 font-medium">User</th>
+                        <th class="px-4 py-3 font-medium">Role</th>
+                        <th class="px-4 py-3 font-medium">Status</th>
+                        <th class="hidden px-4 py-3 font-medium md:table-cell">Created</th>
+                        <th class="px-4 py-3 font-medium"></th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-200 dark:divide-slate-800">
+                    @foreach (var u in Store.List())
+                    {
+                        var isMe = u.Username.Equals(_me, StringComparison.OrdinalIgnoreCase);
+                        <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/30 @(u.Disabled ? "opacity-60" : "")">
+                            <td class="px-4 py-3">
+                                <div class="flex items-center gap-3">
+                                    <div class="@($"grid size-9 shrink-0 place-items-center rounded-full text-sm font-semibold text-white {(u.IsAdmin ? "bg-gradient-to-br from-amber-500 to-rose-500" : "bg-gradient-to-br from-indigo-500 to-sky-500")}")">
+                                        @u.Username[..1].ToUpperInvariant()
+                                    </div>
+                                    <div class="min-w-0">
+                                        <div class="flex items-center gap-1.5 font-medium text-slate-900 dark:text-white">
+                                            <span class="truncate">@u.DisplayName</span>
+                                            @if (isMe) { <span class="rounded bg-indigo-500/15 px-1.5 text-[10px] font-semibold uppercase text-indigo-600 dark:text-indigo-300">you</span> }
+                                        </div>
+                                        <div class="truncate font-mono text-xs text-slate-500">@u.Username</div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="px-4 py-3">
+                                @if (u.IsBuiltIn)
+                                {
+                                    <RoleBadge IsAdmin="u.IsAdmin" />
+                                }
+                                else
+                                {
+                                    <select class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                                            value="@(u.IsAdmin ? Roles.Admin : Roles.Viewer)" disabled="@isMe"
+                                            title="@(isMe ? "You cannot change your own role" : "Change role")"
+                                            @onchange="e => SetRole(u, e.Value?.ToString() == Roles.Admin)">
+                                        <option value="@Roles.Viewer">Viewer</option>
+                                        <option value="@Roles.Admin">Admin</option>
+                                    </select>
+                                }
+                            </td>
+                            <td class="px-4 py-3">
+                                @if (u.IsBuiltIn)
+                                {
+                                    <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Defined in appsettings / environment variables: change it there">
+                                        <Icon Name="lock" Class="size-3" /> Built-in
+                                    </span>
+                                }
+                                else if (u.Disabled)
+                                {
+                                    <span class="inline-flex items-center gap-1.5 rounded-full bg-rose-500/10 px-2 py-0.5 text-xs font-medium text-rose-600 dark:text-rose-400"><span class="size-1.5 rounded-full bg-rose-500"></span> Disabled</span>
+                                }
+                                else
+                                {
+                                    <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400"><span class="size-1.5 rounded-full bg-emerald-500"></span> Active</span>
+                                }
+                            </td>
+                            <td class="hidden px-4 py-3 text-xs text-slate-500 md:table-cell">
+                                @if (u.CreatedAt is { } c)
+                                {
+                                    <div>@c.ToString("yyyy-MM-dd HH:mm")</div>
+                                    <div class="text-slate-400">by @u.CreatedBy</div>
+                                }
+                                else
+                                {
+                                    <span class="text-slate-400">configuration</span>
+                                }
+                            </td>
+                            <td class="px-4 py-3">
+                                @if (!u.IsBuiltIn)
+                                {
+                                    <div class="flex justify-end gap-1">
+                                        <button class="btn-icon" title="Edit display name / reset password" @onclick="() => OpenEdit(u)"><Icon Name="pencil" /></button>
+                                        @if (!isMe)
+                                        {
+                                            <button class="btn-icon" title="@(u.Disabled ? "Enable" : "Disable")" @onclick="() => ToggleDisabled(u)"><Icon Name="@(u.Disabled ? "check" : "ban")" /></button>
+                                            <button class="btn-icon hover:!text-rose-500" title="Delete" @onclick="() => _deleting = u"><Icon Name="trash" /></button>
+                                        }
+                                    </div>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+
+        <p class="mt-4 text-xs text-slate-400">
+            <em>Built-in</em> users (the initial administrator) are defined in <code>appsettings.json</code> or environment variables.
+            Passwords are stored as PBKDF2 hashes. Role changes and disabled accounts take effect immediately.
+        </p>
+    </ChildContent>
+</AdminShell>
+
+@* ---------- Add ---------- *@
+<Modal Open="_new is not null" OnClose="() => _new = null" Title="Add user">
+    <ChildContent>
+        @if (_new is { } n)
+        {
+            <div class="space-y-4">
+                <div class="grid gap-4 sm:grid-cols-2">
+                    <Field Label="Username"><input class="input" @bind="n.Username" autocomplete="off" placeholder="mario.rossi" /></Field>
+                    <Field Label="Display name"><input class="input" @bind="n.DisplayName" autocomplete="off" placeholder="Mario Rossi" /></Field>
+                    <Field Label="Password" Hint="@($"At least {UserStore.MinPasswordLength} characters")"><input class="input" type="password" @bind="n.Password" autocomplete="new-password" /></Field>
+                    <Field Label="Confirm password"><input class="input" type="password" @bind="n.Confirm" autocomplete="new-password" /></Field>
+                </div>
+                <Field Label="Role">
+                    <div class="grid gap-2 sm:grid-cols-2">
+                        <RoleOption Selected="!n.IsAdmin" OnSelect="() => n.IsAdmin = false" Title="Viewer" IconName="user"
+                                    Description="Browse sources and run read-only queries, export results." />
+                        <RoleOption Selected="n.IsAdmin" OnSelect="() => n.IsAdmin = true" Title="Admin" IconName="shield"
+                                    Description="Everything, plus any SQL statement and managing sources and users." />
+                    </div>
+                </Field>
+                <FormError Message="@_formError" />
+            </div>
+        }
+    </ChildContent>
+    <Footer>
+        <button class="btn-ghost" @onclick="() => _new = null">Cancel</button>
+        <button class="btn-primary" @onclick="Create"><Icon Name="plus" /> Create user</button>
+    </Footer>
+</Modal>
+
+@* ---------- Edit ---------- *@
+<Modal Open="_edit is not null" OnClose="() => _edit = null" Title="@($"Edit {_edit?.Username}")">
+    <ChildContent>
+        @if (_edit is { } e)
+        {
+            <div class="space-y-4">
+                <Field Label="Display name"><input class="input" @bind="e.DisplayName" autocomplete="off" /></Field>
+                <div class="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+                    <div class="mb-3 text-sm font-medium">Reset password <span class="font-normal text-slate-400">(optional)</span></div>
+                    <div class="grid gap-4 sm:grid-cols-2">
+                        <Field Label="New password"><input class="input" type="password" @bind="e.Password" autocomplete="new-password" /></Field>
+                        <Field Label="Confirm"><input class="input" type="password" @bind="e.Confirm" autocomplete="new-password" /></Field>
+                    </div>
+                </div>
+                <FormError Message="@_formError" />
+            </div>
+        }
+    </ChildContent>
+    <Footer>
+        <button class="btn-ghost" @onclick="() => _edit = null">Cancel</button>
+        <button class="btn-primary" @onclick="SaveEdit">Save</button>
+    </Footer>
+</Modal>
+
+@* ---------- Delete ---------- *@
+<Modal Open="_deleting is not null" OnClose="() => _deleting = null" Title="Delete user?" Width="max-w-md">
+    <ChildContent>
+        <p class="text-sm text-slate-600 dark:text-slate-300">
+            <span class="font-semibold">@_deleting?.DisplayName</span> (<span class="font-mono">@_deleting?.Username</span>) will be signed out and will no longer be able to sign in.
+            Consider disabling the account instead if you may need it again.
+        </p>
+    </ChildContent>
+    <Footer>
+        <button class="btn-ghost" @onclick="() => _deleting = null">Cancel</button>
+        <button class="btn-danger" @onclick="Delete">Delete</button>
+    </Footer>
+</Modal>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private sealed class NewUser
+    {
+        public string Username { get; set; } = "";
+        public string? DisplayName { get; set; }
+        public string Password { get; set; } = "";
+        public string Confirm { get; set; } = "";
+        public bool IsAdmin { get; set; }
+    }
+
+    private sealed class EditUser
+    {
+        public string Username { get; set; } = "";
+        public string? DisplayName { get; set; }
+        public string? Password { get; set; }
+        public string? Confirm { get; set; }
+    }
+
+    private string _me = "";
+    private NewUser? _new;
+    private EditUser? _edit;
+    private UserSummary? _deleting;
+    private string? _formError;
+    private string? _message;
+    private bool _messageIsError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _me = (await AuthState).User.Identity?.Name ?? "";
+        Store.Changed += OnChanged;
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    private bool EnsureAdmin()
+    {
+        if (Store.IsAdmin(_me)) return true;
+        Show("Your account is no longer an administrator.", true);
+        _new = null;
+        _edit = null;
+        _deleting = null;
+        return false;
+    }
+
+    private void OpenNew()
+    {
+        _new = new NewUser();
+        _formError = null;
+    }
+
+    private void Create()
+    {
+        if (_new is not { } n || !EnsureAdmin()) return;
+        if (n.Password != n.Confirm) { _formError = "Passwords do not match."; return; }
+        _formError = Store.Create(n.Username, n.DisplayName, n.Password, n.IsAdmin, _me);
+        if (_formError is not null) return;
+        Show($"User '{n.Username.Trim()}' created as {(n.IsAdmin ? "Admin" : "Viewer")}.", false);
+        _new = null;
+    }
+
+    private void OpenEdit(UserSummary u)
+    {
+        _edit = new EditUser { Username = u.Username, DisplayName = u.DisplayName == u.Username ? null : u.DisplayName };
+        _formError = null;
+    }
+
+    private void SaveEdit()
+    {
+        if (_edit is not { } e || !EnsureAdmin()) return;
+        if (!string.IsNullOrEmpty(e.Password) || !string.IsNullOrEmpty(e.Confirm))
+        {
+            if (e.Password != e.Confirm) { _formError = "Passwords do not match."; return; }
+            if (UserStore.ValidatePassword(e.Password) is { } pwdError) { _formError = pwdError; return; }
+        }
+        _formError = Store.SetDisplayName(e.Username, e.DisplayName, _me);
+        if (_formError is null && !string.IsNullOrEmpty(e.Password))
+            _formError = Store.ResetPassword(e.Username, e.Password, _me);
+        if (_formError is not null) return;
+        Show(string.IsNullOrEmpty(e.Password) ? $"User '{e.Username}' updated." : $"User '{e.Username}' updated, password reset.", false);
+        _edit = null;
+    }
+
+    private void SetRole(UserSummary u, bool isAdmin)
+    {
+        if (!EnsureAdmin()) return;
+        var error = Store.SetRole(u.Username, isAdmin, _me);
+        Show(error ?? $"{u.Username} is now {(isAdmin ? "an Admin" : "a Viewer")}.", error is not null);
+    }
+
+    private void ToggleDisabled(UserSummary u)
+    {
+        if (!EnsureAdmin()) return;
+        var error = Store.SetDisabled(u.Username, !u.Disabled, _me);
+        Show(error ?? $"User '{u.Username}' {(u.Disabled ? "enabled" : "disabled")}.", error is not null);
+    }
+
+    private void Delete()
+    {
+        if (_deleting is not { } u || !EnsureAdmin()) return;
+        var error = Store.Delete(u.Username, _me);
+        _deleting = null;
+        Show(error ?? $"User '{u.Username}' deleted.", error is not null);
+    }
+
+    private void Show(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+
+    public void Dispose() => Store.Changed -= OnChanged;
+}

@@ -24,22 +24,28 @@ if (args.Length > 0 && args[0] == "install-extensions")
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<ExplorerOptions>(builder.Configuration.GetSection(ExplorerOptions.Section));
+// Folder for users.json / sources.json / data protection keys.
+var stateDir = Path.GetFullPath(
+    builder.Configuration[$"{ExplorerOptions.Section}:StateDirectory"] is { Length: > 0 } sd ? sd : "App_Data",
+    builder.Environment.ContentRootPath);
+Directory.CreateDirectory(stateDir);
+
 builder.Services.PostConfigure<ExplorerOptions>(o =>
 {
+    o.StateDirectory = stateDir;
     // Relative local paths are resolved against the content root, not the working directory.
     foreach (var src in o.DataSources.Where(s => s.Type == DataSourceType.Local && !string.IsNullOrWhiteSpace(s.Path)))
         src.Path = Path.GetFullPath(src.Path!, builder.Environment.ContentRootPath);
 });
 var authOptions = builder.Configuration.GetSection(ExplorerOptions.Section).Get<ExplorerOptions>()?.Auth ?? new AuthOptions();
 
-// Persist cookie encryption keys so sessions survive restarts (mount this folder as a volume in containers).
-var keysPath = builder.Configuration[$"{ExplorerOptions.Section}:DataProtectionKeysPath"];
-if (!string.IsNullOrWhiteSpace(keysPath))
-{
-    builder.Services.AddDataProtection()
-        .PersistKeysToFileSystem(new DirectoryInfo(keysPath))
-        .SetApplicationName("ParquetExplorer");
-}
+// Persist the keys protecting cookies and stored S3 secrets (keep this folder in a volume in containers).
+var keysPath = builder.Configuration[$"{ExplorerOptions.Section}:DataProtectionKeysPath"] is { Length: > 0 } kp
+    ? Path.GetFullPath(kp, builder.Environment.ContentRootPath)
+    : Path.Combine(stateDir, "keys");
+builder.Services.AddDataProtection()
+    .PersistKeysToFileSystem(new DirectoryInfo(keysPath))
+    .SetApplicationName("ParquetExplorer");
 
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents(o => o.DetailedErrors = builder.Environment.IsDevelopment());
@@ -49,7 +55,7 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     {
         o.LoginPath = "/login";
         o.LogoutPath = "/auth/logout";
-        o.AccessDeniedPath = "/login";
+        o.AccessDeniedPath = "/access-denied";
         o.Cookie.Name = "px_auth";
         o.Cookie.HttpOnly = true;
         o.Cookie.SameSite = SameSiteMode.Strict;
@@ -58,9 +64,20 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         o.SlidingExpiration = true;
         o.Events.OnValidatePrincipal = ctx =>
         {
-            // Users removed from configuration lose access immediately.
+            // Deleted or disabled users lose access; role changes apply without signing in again.
             var store = ctx.HttpContext.RequestServices.GetRequiredService<UserStore>();
-            if (!store.Exists(ctx.Principal?.Identity?.Name)) ctx.RejectPrincipal();
+            var name = ctx.Principal?.Identity?.Name;
+            var current = name is null ? null : store.CreatePrincipal(name);
+            if (current is null)
+            {
+                ctx.RejectPrincipal();
+            }
+            else if (current.IsInRole(Roles.Admin) != ctx.Principal!.IsInRole(Roles.Admin)
+                     || current.FindFirst("display_name")?.Value != ctx.Principal.FindFirst("display_name")?.Value)
+            {
+                ctx.ReplacePrincipal(current);
+                ctx.ShouldRenew = true;
+            }
             return Task.CompletedTask;
         };
         o.Events.OnRedirectToLogin = ctx =>
@@ -80,6 +97,7 @@ builder.Services.AddCascadingAuthenticationState();
 
 builder.Services.AddSingleton<UserStore>();
 builder.Services.AddSingleton<DuckDbEngine>();
+builder.Services.AddSingleton<SourceRegistry>();
 builder.Services.AddSingleton<CatalogService>();
 builder.Services.AddSingleton<QueryHistoryService>();
 builder.Services.AddSingleton<QueryService>();
@@ -94,8 +112,9 @@ builder.Services.Configure<ForwardedHeadersOptions>(o =>
 
 var app = builder.Build();
 
-if (authOptions.Users.Count == 0)
-    app.Logger.LogWarning("No users configured: add users under ParquetExplorer:Auth:Users (see README).");
+if (!authOptions.Users.Any(u => u.Roles.Contains(Roles.Admin, StringComparer.OrdinalIgnoreCase)))
+    app.Logger.LogWarning("No initial admin configured: add one under ParquetExplorer:Auth:Users (see README).");
+app.Logger.LogInformation("State directory: {StateDir}", stateDir);
 
 // Start DuckDB eagerly so configuration errors surface at start-up.
 app.Services.GetRequiredService<DuckDbEngine>();

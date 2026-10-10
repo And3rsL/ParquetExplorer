@@ -1,0 +1,70 @@
+@inject IJSRuntime JS
+
+<div class="flex min-h-screen flex-col">
+    <header class="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur dark:border-slate-800 dark:bg-slate-900/80">
+        <div class="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4">
+            <a href="" class="flex items-center gap-2">
+                <img src="favicon.svg" alt="" class="size-6" />
+                <span class="hidden text-sm font-semibold tracking-tight text-slate-900 sm:inline dark:text-white">Parquet Explorer</span>
+            </a>
+            <span class="rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">Admin</span>
+
+            <nav class="ml-4 flex items-center gap-1">
+                <a href="" class="btn-ghost"><Icon Name="arrow-left" /> <span class="hidden sm:inline">Workbench</span></a>
+                <NavLink href="admin/sources" class="btn-ghost" ActiveClass="!bg-indigo-50 !text-indigo-700 dark:!bg-indigo-500/15 dark:!text-indigo-200">
+                    <Icon Name="database" /> Data sources
+                </NavLink>
+                <NavLink href="admin/users" class="btn-ghost" ActiveClass="!bg-indigo-50 !text-indigo-700 dark:!bg-indigo-500/15 dark:!text-indigo-200">
+                    <Icon Name="users" /> Users
+                </NavLink>
+            </nav>
+
+            <div class="ml-auto flex items-center gap-1">
+                <button class="btn-icon" @onclick="ToggleTheme" title="Toggle theme"><Icon Name="@(_dark ? "sun" : "moon")" /></button>
+                <AuthorizeView>
+                    <span class="hidden px-2 text-xs text-slate-500 sm:inline">@context.User.FindFirst("display_name")?.Value</span>
+                </AuthorizeView>
+                <form method="post" action="auth/logout" data-enhance="false">
+                    <AntiforgeryToken />
+                    <button type="submit" class="btn-icon" title="Sign out"><Icon Name="logout" /></button>
+                </form>
+            </div>
+        </div>
+    </header>
+
+    <main class="mx-auto w-full max-w-6xl flex-1 px-4 py-8">
+        <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
+            <div>
+                <h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-white">@Title</h1>
+                @if (Description is not null)
+                {
+                    <p class="mt-1 max-w-2xl text-sm text-slate-500 dark:text-slate-400">@Description</p>
+                }
+            </div>
+            @Actions
+        </div>
+        @ChildContent
+    </main>
+</div>
+
+@code {
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public string? Description { get; set; }
+    [Parameter] public RenderFragment? Actions { get; set; }
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    private bool _dark = true;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        _dark = await JS.InvokeAsync<bool>("pxEditor.isDark");
+        StateHasChanged();
+    }
+
+    private async Task ToggleTheme()
+    {
+        _dark = !_dark;
+        await JS.InvokeVoidAsync("pxEditor.setDark", _dark);
+    }
+}

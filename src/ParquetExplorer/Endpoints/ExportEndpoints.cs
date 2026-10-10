@@ -16,8 +16,10 @@ public static class ExportEndpoints
     public static void MapExportEndpoints(this IEndpointRouteBuilder app)
     {
         // Exports the full result of a single SELECT (no row limit) by letting DuckDB stream it to a temp file.
-        app.MapPost("/api/export", async (ExportRequest req, HttpContext ctx, DuckDbEngine engine, ILogger<DuckDbEngine> logger) =>
+        app.MapPost("/api/export", async (ExportRequest req, HttpContext ctx, DuckDbEngine engine, UserStore users, ILogger<DuckDbEngine> logger) =>
         {
+            if (!users.IsActive(ctx.User.Identity?.Name)) return Results.Unauthorized();
+
             if (!Formats.TryGetValue(req.Format ?? "", out var fmt))
                 return Results.BadRequest("Unknown format.");
 

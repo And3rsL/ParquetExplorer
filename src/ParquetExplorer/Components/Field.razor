@@ -1,0 +1,14 @@
+<div class="block">
+    <span class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-slate-300">@Label</span>
+    @ChildContent
+    @if (Hint is not null)
+    {
+        <span class="mt-1 block text-xs text-slate-400">@Hint</span>
+    }
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public string? Hint { get; set; }
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+}

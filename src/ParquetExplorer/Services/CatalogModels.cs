@@ -36,6 +36,7 @@ public sealed class SourceInfo
     public required string Schema { get; init; }
     public required DataSourceType Type { get; init; }
     public required string RootUri { get; init; }
+    public required DataSourceOptions Options { get; init; }
     public IReadOnlyList<TableInfo> Tables { get; set; } = [];
     public string? Error { get; set; }
     public bool Loading { get; set; }
