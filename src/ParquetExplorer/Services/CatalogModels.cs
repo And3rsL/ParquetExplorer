@@ -4,6 +4,9 @@ namespace ParquetExplorer.Services;
 
 public sealed record ColumnInfo(string Name, string Type, bool IsPartitionKey);
 
+/// <summary>A data file of a table and its partition values (aligned with <see cref="TableInfo.PartitionKeys"/>).</summary>
+public sealed record TableFile(string Uri, string?[] PartitionValues);
+
 public sealed class TableInfo
 {
     public required string Source { get; init; }
@@ -30,6 +33,16 @@ public sealed class TableInfo
     public IReadOnlyList<ColumnInfo> Columns { get; set; } = [];
     public string? Error { get; set; }
 
+    /// <summary>Every data file found by the scan: lets queries read only the partitions they filter on.</summary>
+    public IReadOnlyList<TableFile> Files { get; init; } = [];
+
+    /// <summary>
+    /// False on network folders: there a DuckDB view over the whole table would list every folder
+    /// at each query (minutes on SMB with tens of thousands of partitions), so queries are rewritten
+    /// to read the files directly instead (see <see cref="PartitionPruner"/>).
+    /// </summary>
+    public bool HasView { get; set; } = true;
+
     public string QualifiedName => SqlText.Qualified(Schema, Name);
 
     /// <summary>Name as a user would naturally type it (quotes only when needed).</summary>
@@ -43,6 +56,9 @@ public sealed class SourceInfo
     public required DataSourceType Type { get; init; }
     public required string RootUri { get; init; }
     public required DataSourceOptions Options { get; init; }
+
+    /// <summary>UNC path or mapped network drive: listing and opening files costs a network round trip each.</summary>
+    public bool IsNetwork { get; init; }
     public IReadOnlyList<TableInfo> Tables { get; set; } = [];
     public string? Error { get; set; }
     public bool Loading { get; set; }

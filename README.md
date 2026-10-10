@@ -178,6 +178,46 @@ tabella a ogni esecuzione, anche quando il filtro tocca una sola partizione. Cre
 non con i GB: compattare in file da 128 MB–1 GB lo riduce in proporzione. Su S3 ogni elenco costa una
 richiesta LIST ogni 1.000 file.
 
+### Lettura delle sole partizioni filtrate
+
+Prima di eseguire una query l'app la analizza con il parser di DuckDB e, per ogni tabella partizionata,
+tiene solo i file le cui cartelle soddisfano le condizioni sulle colonne di partizione
+(`=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN` in AND nella `WHERE`). La tabella viene sostituita da
+`read_parquet([quei file])`. Il pannello **Messages** indica quanti file sono stati letti.
+
+- Funziona anche dentro JOIN, CTE, sottoquery, `UNION`, `EXPLAIN`, `DESCRIBE`/`SUMMARIZE` e negli export.
+- Le condizioni che non riconosce (per esempio `OR`, funzioni sulla colonna) non escludono nessun file:
+  il risultato è sempre identico a una lettura completa.
+- `SELECT … FROM t [WHERE partizioni] [LIMIT n]` senza ORDER BY, aggregati o altri filtri legge solo i primi
+  file che bastano a riempire il limite (o la griglia): "Select top 1000" risponde subito.
+- Conviene quindi filtrare sempre sulle colonne di partizione (con l'icona a chiave nell'Object Explorer).
+
+### Cartelle di rete (SMB/NFS)
+
+Su una condivisione di rete ogni elenco di cartella e ogni apertura di file è una richiesta di rete, e
+DuckDB le fa una alla volta: per una tabella con 50.000 cartelle di partizione erano 5–8 minuti a **ogni**
+query. Per le sorgenti di rete (`\\server\share`, unità di rete mappate, oppure `NetworkStorage: true` per
+una condivisione montata come cartella locale, per esempio CIFS su Linux):
+
+- l'app elenca le cartelle da sola, 32 alla volta, ritentando gli errori di rete temporanei;
+- non crea viste DuckDB: le colonne vengono lette da un solo file e ogni query legge solo i file scelti
+  come sopra;
+- una query senza filtri sulle partizioni legge comunque tutta la tabella: il pannello Messages lo segnala.
+
+Misure su una condivisione Samba, tabella da **45.956 file / 50.493 cartelle / 202 GB**
+(4 livelli di partizione):
+
+| | Prima | Ora |
+|---|---|---|
+| Select top 1000 | 5–8 min | 0,5 s |
+| `DESCRIBE` | 5–8 min | 0,1 s |
+| `count(*)` di un giorno (286 file, 47 milioni di righe) | 5–8 min | 11 s |
+| un giorno e un `emittente` (1 file) | 5–8 min | 0,1 s |
+
+Lo scan (e il refresh periodico, che non blocca le query) costa il tempo di elencare tutte le cartelle:
+circa 1 minuto ogni 100.000 file su quella condivisione. Con molte cartelle conviene alzare
+`CatalogRefreshMinutes` e usare il pulsante di refresh quando arrivano dati nuovi.
+
 ## Sicurezza
 
 - Tutte le pagine e le API richiedono il login; cookie `HttpOnly`, `SameSite=Strict`, sessione scorrevole.

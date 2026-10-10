@@ -195,6 +195,11 @@
                             <span>Union by name <span class="block text-xs text-slate-400">Merge files with different column sets (reads every file footer, slower to load).</span></span></label>
                         <label class="flex items-start gap-2"><input type="checkbox" class="mt-0.5 size-4 accent-indigo-600" @bind="f.RootFilesAsTables" />
                             <span>Root files as tables <span class="block text-xs text-slate-400">Each parquet file directly in the root becomes its own table.</span></span></label>
+                        @if (f.Type == DataSourceType.Local)
+                        {
+                            <label class="flex items-start gap-2"><input type="checkbox" class="mt-0.5 size-4 accent-indigo-600" @bind="f.NetworkStorage" />
+                                <span>Network share <span class="block text-xs text-slate-400">SMB/NFS folder mounted as a local path (detected automatically for \\server\share paths and network drives). Queries then read only the partitions they filter on.</span></span></label>
+                        }
                     </div>
                 </details>
 
@@ -274,6 +279,7 @@
         public bool HasStoredToken { get; set; }
         public bool UnionByName { get; set; }
         public bool RootFilesAsTables { get; set; } = true;
+        public bool NetworkStorage { get; set; }
     }
 
     private string _me = "";
@@ -321,7 +327,7 @@
             Endpoint = o.Endpoint, UrlStyle = o.UrlStyle ?? "", UseSsl = o.UseSsl, UseCredentialChain = o.UseCredentialChain,
             AccessKeyId = o.AccessKeyId, HasStoredSecret = !string.IsNullOrEmpty(o.SecretAccessKey),
             HasStoredToken = !string.IsNullOrEmpty(o.SessionToken),
-            UnionByName = o.UnionByName, RootFilesAsTables = o.RootFilesAsTables,
+            UnionByName = o.UnionByName, RootFilesAsTables = o.RootFilesAsTables, NetworkStorage = o.NetworkStorage == true,
         };
         _formError = null;
         _test = null;
@@ -345,6 +351,7 @@
             SecretAccessKey = !string.IsNullOrEmpty(f.SecretAccessKey) ? f.SecretAccessKey : f.HasStoredSecret ? stored?.SecretAccessKey : null,
             SessionToken = !string.IsNullOrEmpty(f.SessionToken) ? f.SessionToken : f.HasStoredToken ? stored?.SessionToken : null,
             UnionByName = f.UnionByName, RootFilesAsTables = f.RootFilesAsTables,
+            NetworkStorage = f.Type == DataSourceType.Local && f.NetworkStorage ? true : null,
         };
     }
 

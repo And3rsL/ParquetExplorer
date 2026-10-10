@@ -19,6 +19,9 @@ public sealed class ResultSet
 public sealed class QueryExecution
 {
     public List<ResultSet> ResultSets { get; } = [];
+
+    /// <summary>Informational messages (e.g. partition pruning), shown in the Messages pane.</summary>
+    public List<string> Notes { get; } = [];
     public TimeSpan Elapsed { get; set; }
     public string? Error { get; set; }
     public bool Cancelled { get; set; }
