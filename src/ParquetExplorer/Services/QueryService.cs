@@ -10,7 +10,8 @@ using ParquetExplorer.Options;
 
 namespace ParquetExplorer.Services;
 
-public sealed class QueryService(DuckDbEngine engine, QueryHistoryService history, UserStore users, IOptions<ExplorerOptions> options, ILogger<QueryService> logger)
+public sealed class QueryService(DuckDbEngine engine, QueryHistoryService history, UserStore users, PartitionPruner pruner,
+    IOptions<ExplorerOptions> options, ILogger<QueryService> logger)
 {
     private readonly QueryOptions _opts = options.Value.Query;
 
@@ -62,8 +63,10 @@ public sealed class QueryService(DuckDbEngine engine, QueryHistoryService histor
             foreach (var statement in statements)
             {
                 linked.Token.ThrowIfCancellationRequested();
+                var rewritten = RewriteSafely(statement, conn, rowLimit);
+                exec.Notes.AddRange(rewritten.Notes);
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = statement;
+                cmd.CommandText = rewritten.Sql;
                 cmd.UseStreamingMode = true;
                 using var reg = linked.Token.Register(() => { try { cmd.Cancel(); } catch { } });
 
@@ -103,6 +106,20 @@ public sealed class QueryService(DuckDbEngine engine, QueryHistoryService histor
         return exec;
     }
 
+    /// <summary>Reads only the partitions a statement needs; on any problem the statement runs unchanged.</summary>
+    public RewriteResult RewriteSafely(string statement, DuckDBConnection conn, int? rowLimit)
+    {
+        try
+        {
+            return pruner.Rewrite(statement, conn, rowLimit);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Partition pruning skipped: {Error}", ex.Message);
+            return new RewriteResult(statement, []);
+        }
+    }
+
     private static ResultSet ReadResult(DuckDBDataReader reader, string statement, int rowLimit, CancellationToken ct)
     {
         var fieldCount = reader.FieldCount;
@@ -120,7 +137,7 @@ public sealed class QueryService(DuckDbEngine engine, QueryHistoryService histor
 
         var rows = new List<string?[]>(Math.Min(rowLimit, 4096));
         var truncated = false;
-        while (reader.Read())
+        while (ReadNext(reader, rows.Count == 0, ct))
         {
             if (rows.Count >= rowLimit)
             {
@@ -136,6 +153,22 @@ public sealed class QueryService(DuckDbEngine engine, QueryHistoryService histor
         }
 
         return new ResultSet { Columns = cols, Rows = rows, Truncated = truncated, Statement = statement };
+    }
+
+    /// <summary>
+    /// DuckDB.NET 1.5 in streaming mode throws on the first Read() of an empty result
+    /// ("unsuccessful or closed pending query result") although the query succeeded: read it as empty.
+    /// </summary>
+    private static bool ReadNext(DuckDBDataReader reader, bool first, CancellationToken ct)
+    {
+        try
+        {
+            return reader.Read();
+        }
+        catch (DuckDBException ex) when (first && !ct.IsCancellationRequested && ex.Message.Contains("unsuccessful or closed pending query result", StringComparison.Ordinal))
+        {
+            return false;
+        }
     }
 
     private static bool IsNumericType(Type t)

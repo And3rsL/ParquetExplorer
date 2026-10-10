@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using ParquetExplorer.Options;
@@ -51,6 +52,7 @@ public sealed partial class CatalogService
             Type = src.Type,
             RootUri = src.RootUri,
             Options = src,
+            IsNetwork = src.Type == DataSourceType.Local && (src.NetworkStorage ?? IsNetworkPath(src.RootUri)),
             Loading = true,
         }).ToList();
     }
@@ -214,7 +216,9 @@ public sealed partial class CatalogService
                 }
             }
 
-            var created = await Task.Run(() => CreateViews(info, tables, unchanged, instance, ct), ct);
+            var created = info.IsNetwork
+                ? await Task.Run(() => DescribeFromFirstFile(info, tables, unchanged, instance, ct), ct)
+                : await Task.Run(() => CreateViews(info, tables, unchanged, instance, ct), ct);
 
             info.Tables = tables.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase).ToList();
             info.Error = null;
@@ -247,16 +251,8 @@ public sealed partial class CatalogService
         {
             var root = src.RootUri;
             if (!Directory.Exists(root)) throw new DirectoryNotFoundException($"Folder not found: {root}");
-            var enumOpts = new EnumerationOptions
-            {
-                RecurseSubdirectories = true,
-                IgnoreInaccessible = true,
-                AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
-            };
-            return new DirectoryInfo(root).EnumerateFiles("*", enumOpts)
-                .Where(f => IsParquet(f.Name))
+            return ListLocalFiles(root, src.NetworkStorage ?? IsNetworkPath(root), IsParquet)
                 .Select(f => new FileEntry(f.FullName, Path.GetRelativePath(root, f.FullName).Replace('\\', '/'), f.Length, f.LastWriteTimeUtc))
-                .Where(f => !IsIgnored(f.Relative))
                 .ToList();
         }
 
@@ -278,6 +274,98 @@ public sealed partial class CatalogService
         return list;
     }
 
+    /// <summary>
+    /// Lists a local or network folder tree one directory per request, many directories at a time.
+    /// On a network share each directory listing is a round trip (a few ms on SMB), so a sequential
+    /// walk of a partitioned table with 50,000 folders takes minutes; in parallel it takes seconds.
+    /// Transient network errors are retried instead of failing the whole source.
+    /// </summary>
+    private static List<FileInfo> ListLocalFiles(string root, bool network, Func<string, bool> isParquet)
+    {
+        var parallelism = network ? 32 : Math.Clamp(Environment.ProcessorCount, 4, 16);
+        var files = new ConcurrentBag<FileInfo>();
+        var errors = new ConcurrentQueue<Exception>();
+        using var work = new BlockingCollection<string>();
+        var pending = 1;
+        work.Add(root);
+
+        var workers = Enumerable.Range(0, parallelism).Select(_ => Task.Run(() =>
+        {
+            foreach (var dir in work.GetConsumingEnumerable())
+            {
+                try
+                {
+                    foreach (var e in ListDirectory(dir))
+                    {
+                        if (e.Name.StartsWith('_') || e.Name.StartsWith('.')
+                            || (e.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
+                        if (e is DirectoryInfo)
+                        {
+                            Interlocked.Increment(ref pending);
+                            work.Add(e.FullName);
+                        }
+                        else if (isParquet(e.Name))
+                        {
+                            files.Add((FileInfo)e);
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException)
+                {
+                    // Folder removed or not readable while listing: skip it.
+                }
+                catch (Exception ex)
+                {
+                    errors.Enqueue(ex);
+                }
+                finally
+                {
+                    if (Interlocked.Decrement(ref pending) == 0) work.CompleteAdding();
+                }
+            }
+        })).ToArray();
+        Task.WaitAll(workers);
+
+        if (!errors.IsEmpty)
+        {
+            var first = errors.First();
+            throw new IOException($"Cannot list {errors.Count} folder(s) under {root}: {first.Message}", first);
+        }
+        return files.OrderBy(f => f.FullName, StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>Lists one directory, retrying transient network errors (SMB "unexpected network error", ...).</summary>
+    private static FileSystemInfo[] ListDirectory(string dir)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return new DirectoryInfo(dir).GetFileSystemInfos();
+            }
+            catch (IOException) when (attempt < 5 && Directory.Exists(dir))
+            {
+                Thread.Sleep(100 * (1 << attempt));
+            }
+        }
+    }
+
+    /// <summary>UNC paths (\\server\share) and mapped network drives.</summary>
+    internal static bool IsNetworkPath(string path)
+    {
+        if (path.StartsWith(@"\\", StringComparison.Ordinal) || path.StartsWith("//", StringComparison.Ordinal)) return true;
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            var drive = Path.GetPathRoot(path);
+            return drive is { Length: > 0 } && new DriveInfo(drive).DriveType == DriveType.Network;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>Skips Spark/Hadoop markers and hidden folders (_temporary, .crc, _delta_log, ...).</summary>
     private static bool IsIgnored(string relative) =>
         relative.Split('/').Any(seg => seg.StartsWith('_') || seg.StartsWith('.'));
@@ -288,6 +376,7 @@ public sealed partial class CatalogService
     private sealed class TableGroup
     {
         public List<FileEntry> Files { get; } = [];
+        public List<Dictionary<string, string>> FileValues { get; } = [];
         public List<string> Keys { get; } = [];
         public Dictionary<string, HashSet<string>> Values { get; } = new(StringComparer.Ordinal);
         public HashSet<string> Exts { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -323,10 +412,14 @@ public sealed partial class CatalogService
                 g = new TableGroup();
                 groups[key] = g;
             }
+            var below = firstPartition >= 0 ? dirs[firstPartition..] : [];
+            var fileValues = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var d in below.Where(d => PartitionSegment().IsMatch(d)))
+                fileValues[d[..d.IndexOf('=')]] = d[(d.IndexOf('=') + 1)..];
             g.Files.Add(f);
+            g.FileValues.Add(fileValues);
             g.Exts.Add(Path.GetExtension(f.Relative));
 
-            var below = firstPartition >= 0 ? dirs[firstPartition..] : [];
             var layout = string.Join('/', below.Select(d => PartitionSegment().IsMatch(d) ? d[..d.IndexOf('=')] + "=*" : "*"));
             if (g.Layout is null && !g.LayoutMixed) g.Layout = layout;
             else if (g.Layout != layout) { g.LayoutMixed = true; g.Layout = null; }
@@ -384,6 +477,8 @@ public sealed partial class CatalogService
                 FileCount = g.Files.Count,
                 TotalBytes = g.Files.All(f => f.Size.HasValue) ? g.Files.Sum(f => f.Size!.Value) : null,
                 Fingerprint = Fingerprint(g.Files),
+                Files = g.Files.Select((f, i) => new TableFile(f.Uri,
+                    g.Keys.Select(k => g.FileValues[i].TryGetValue(k, out var v) ? v : null).ToArray())).ToList(),
             });
         }
         return tables;
@@ -431,12 +526,14 @@ public sealed partial class CatalogService
         return h;
     }
 
-    private static string ReadParquetExpr(DataSourceOptions src, TableInfo t)
+    /// <summary>read_parquet over the table's globs or, when given, over an explicit list of its files.</summary>
+    internal static string ReadParquetExpr(DataSourceOptions src, TableInfo t, IReadOnlyList<string>? files = null)
     {
-        var files = t.Locations.Count == 1
-            ? SqlText.Literal(t.Locations[0])
-            : "[" + string.Join(", ", t.Locations.Select(SqlText.Literal)) + "]";
-        var args = new List<string> { files };
+        var paths = files ?? t.Locations;
+        var list = paths.Count == 1
+            ? SqlText.Literal(paths[0])
+            : "[" + string.Join(", ", paths.Select(SqlText.Literal)) + "]";
+        var args = new List<string> { list };
         if (t.HivePartitioned)
         {
             args.Add("hive_partitioning = true");
@@ -444,6 +541,42 @@ public sealed partial class CatalogService
         }
         if (src.UnionByName || t.Locations.Count > 1) args.Add("union_by_name = true");
         return $"read_parquet({string.Join(", ", args)})";
+    }
+
+    /// <summary>
+    /// Network folders: reads each table's columns from its first file instead of creating a view.
+    /// A view would make DuckDB list every folder of the table, one at a time, at creation and at
+    /// every query; queries read the files chosen by <see cref="PartitionPruner"/> instead.
+    /// </summary>
+    /// <returns>Number of tables described.</returns>
+    private static int DescribeFromFirstFile(SourceInfo info, List<TableInfo> tables, HashSet<string> unchanged, EngineInstance instance, CancellationToken ct)
+    {
+        var todo = tables.Where(t => !unchanged.Contains(t.Name)).ToList();
+        foreach (var t in tables) t.HasView = false;
+        Parallel.ForEach(todo, new ParallelOptions { MaxDegreeOfParallelism = 16, CancellationToken = ct }, t =>
+        {
+            t.Error = null;
+            try
+            {
+                using var c = instance.OpenConnection();
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = $"DESCRIBE SELECT * FROM {ReadParquetExpr(info.Options, t, [t.Files[0].Uri])}";
+                using var r = cmd.ExecuteReader();
+                var cols = new List<ColumnInfo>();
+                while (r.Read())
+                {
+                    var name = r.GetString(0);
+                    cols.Add(new ColumnInfo(name, r.GetString(1), t.PartitionKeys.Contains(name)));
+                }
+                t.Columns = cols;
+            }
+            catch (Exception ex)
+            {
+                t.Error = ex.Message;
+                t.Columns = [];
+            }
+        });
+        return todo.Count;
     }
 
     /// <summary>

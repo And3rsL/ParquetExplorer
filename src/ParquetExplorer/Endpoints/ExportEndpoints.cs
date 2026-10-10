@@ -16,7 +16,7 @@ public static class ExportEndpoints
     public static void MapExportEndpoints(this IEndpointRouteBuilder app)
     {
         // Exports the full result of a single SELECT (no row limit) by letting DuckDB stream it to a temp file.
-        app.MapPost("/api/export", async (ExportRequest req, HttpContext ctx, DuckDbEngine engine, UserStore users, ILogger<DuckDbEngine> logger) =>
+        app.MapPost("/api/export", async (ExportRequest req, HttpContext ctx, DuckDbEngine engine, UserStore users, QueryService queries, ILogger<DuckDbEngine> logger) =>
         {
             if (!users.IsActive(ctx.User.Identity?.Name)) return Results.Unauthorized();
 
@@ -38,7 +38,9 @@ public static class ExportEndpoints
                 {
                     using var conn = engine.OpenConnection();
                     using var cmd = conn.CreateCommand();
-                    cmd.CommandText = $"COPY ({sql}) TO {SqlText.Literal(file)} ({fmt.CopyOptions})";
+                    // Whole result (no row limit), still reading only the partitions the query filters on.
+                    var source = queries.RewriteSafely(sql, conn, rowLimit: null).Sql;
+                    cmd.CommandText = $"COPY ({source}) TO {SqlText.Literal(file)} ({fmt.CopyOptions})";
                     using var reg = ctx.RequestAborted.Register(() => { try { cmd.Cancel(); } catch { } });
                     cmd.ExecuteNonQuery();
                 }, ctx.RequestAborted);

@@ -100,6 +100,7 @@ builder.Services.AddSingleton<DuckDbEngine>();
 builder.Services.AddSingleton<SourceRegistry>();
 builder.Services.AddSingleton<CatalogService>();
 builder.Services.AddSingleton<QueryHistoryService>();
+builder.Services.AddSingleton<PartitionPruner>();
 builder.Services.AddSingleton<QueryService>();
 builder.Services.AddHostedService<CatalogRefreshService>();
 

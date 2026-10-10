@@ -487,8 +487,12 @@
                 NewTab($"SUMMARIZE {name};", $"summarize {t.Name}", run: true);
                 break;
             case TableActionKind.Files:
-                var files = t.Locations.Count == 1 ? SqlText.Literal(t.Locations[0]) : "[" + string.Join(", ", t.Locations.Select(SqlText.Literal)) + "]";
-                NewTab($"SELECT file_name, num_rows, num_row_groups, format_version, created_by\nFROM parquet_file_metadata({files})\nORDER BY file_name;", $"files {t.Name}", run: true);
+                // Reading every footer of a large table takes long (one file at a time on network shares): show the first ones.
+                const int maxFiles = 200;
+                var paths = t.Files.Count > maxFiles ? t.Files.Take(maxFiles).Select(f => f.Uri).ToList() : t.Locations;
+                var files = paths.Count == 1 ? SqlText.Literal(paths[0]) : "[" + string.Join(", ", paths.Select(SqlText.Literal)) + "]";
+                var header = t.Files.Count > maxFiles ? $"-- First {maxFiles} of {t.Files.Count:N0} files\n" : "";
+                NewTab($"{header}SELECT file_name, num_rows, num_row_groups, format_version, created_by\nFROM parquet_file_metadata({files})\nORDER BY file_name;", $"files {t.Name}", run: true);
                 break;
             case TableActionKind.ScriptSelect:
                 var cols = t.Columns.Count == 0 ? "*" : string.Join(",\n       ", t.Columns.Select(c => IsSimple(c.Name) ? c.Name : SqlText.Ident(c.Name)));

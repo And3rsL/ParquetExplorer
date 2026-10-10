@@ -63,7 +63,8 @@ public sealed class CatalogIntegrationTests : IAsyncLifetime
         _engine = new DuckDbEngine(options, NullLogger<DuckDbEngine>.Instance);
         _registry = new SourceRegistry(options, new EphemeralDataProtectionProvider(), NullLogger<SourceRegistry>.Instance);
         _catalog = new CatalogService(_engine, _registry, NullLogger<CatalogService>.Instance);
-        _queries = new QueryService(_engine, new QueryHistoryService(options), _users, options, NullLogger<QueryService>.Instance);
+        _queries = new QueryService(_engine, new QueryHistoryService(options), _users,
+            new PartitionPruner(_catalog, NullLogger<PartitionPruner>.Instance), options, NullLogger<QueryService>.Instance);
         await _catalog.ReloadAsync();
     }
 

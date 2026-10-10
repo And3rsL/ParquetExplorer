@@ -48,6 +48,13 @@ public sealed class DataSourceOptions
     /// </summary>
     public bool UnionByName { get; set; }
 
+    /// <summary>
+    /// Network storage (SMB/NFS): tables get no DuckDB view and every query reads only the files
+    /// it needs, listed by the app. Null = automatic (UNC paths and mapped network drives on Windows).
+    /// Set it to true for shares mounted as a local folder (e.g. a CIFS mount on Linux).
+    /// </summary>
+    public bool? NetworkStorage { get; set; }
+
     /// <summary>Parquet files directly in the root become one table each (default true).</summary>
     public bool RootFilesAsTables { get; set; } = true;
 
