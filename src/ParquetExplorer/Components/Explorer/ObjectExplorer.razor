@@ -1,0 +1,190 @@
+@implements IDisposable
+@inject CatalogService Catalog
+
+<div class="flex h-full flex-col">
+    <div class="flex items-center justify-between px-3 pt-3 pb-2">
+        <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Object Explorer</span>
+        <button class="btn-icon size-7" title="Refresh all sources" @onclick="RefreshAll" disabled="@_refreshing">
+            <Icon Name="refresh" Class="@("size-3.5 " + (_refreshing ? "animate-spin" : ""))" />
+        </button>
+    </div>
+    <div class="px-3 pb-2">
+        <div class="relative">
+            <span class="pointer-events-none absolute inset-y-0 left-2.5 flex items-center text-slate-400"><Icon Name="search" Class="size-3.5" /></span>
+            <input class="input py-1.5 pl-8 text-[13px]" placeholder="Filter tables or columns…" @bind="_filter" @bind:event="oninput" />
+        </div>
+    </div>
+
+    <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-4">
+        @foreach (var src in Catalog.Sources)
+        {
+            var expanded = !_collapsedSources.Contains(src.Name);
+            var tables = FilteredTables(src).ToList();
+            <div class="mb-1">
+                <div class="tree-row group font-medium" @onclick="() => Toggle(_collapsedSources, src.Name)">
+                    <Icon Name="@(expanded ? "chevron-down" : "chevron-right")" Class="size-3.5 text-slate-400" />
+                    <Icon Name="@(src.Type == DataSourceType.S3 ? "cloud" : "hard-drive")" Class="size-4 text-indigo-500 dark:text-indigo-400" />
+                    <span class="truncate">@src.Name</span>
+                    <span class="ml-auto flex items-center gap-1">
+                        @if (src.Loading)
+                        {
+                            <Icon Name="refresh" Class="size-3 animate-spin text-slate-400" />
+                        }
+                        else
+                        {
+                            <span class="rounded-full bg-slate-100 px-1.5 text-[10px] text-slate-500 dark:bg-slate-800 dark:text-slate-400">@src.Tables.Count</span>
+                        }
+                        <button class="hidden rounded p-0.5 text-slate-400 hover:text-indigo-500 group-hover:block" title="Refresh @src.Name"
+                                @onclick="() => Refresh(src.Name)" @onclick:stopPropagation>
+                            <Icon Name="refresh" Class="size-3" />
+                        </button>
+                    </span>
+                </div>
+
+                @if (expanded)
+                {
+                    <div class="ml-3.5 border-l border-slate-200 pl-1.5 dark:border-slate-800">
+                        <div class="truncate px-2 py-0.5 font-mono text-[10.5px] text-slate-400" title="@src.RootUri">@src.RootUri</div>
+                        @if (src.Error is not null)
+                        {
+                            <div class="mx-1 my-1 flex gap-1.5 rounded-md bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-300">
+                                <Icon Name="alert" Class="mt-0.5 size-3.5 shrink-0" />
+                                <span class="break-words">@src.Error</span>
+                            </div>
+                        }
+                        else if (!src.Loading && src.Tables.Count == 0)
+                        {
+                            <div class="px-2 py-1 text-xs italic text-slate-400">No parquet folders found</div>
+                        }
+
+                        @foreach (var t in tables)
+                        {
+                            var key = t.Schema + "." + t.Name;
+                            var tOpen = _expandedTables.Contains(key);
+                            <div class="tree-row group @(t.Error is not null ? "text-rose-500" : "")"
+                                 title="@($"{t.DisplayQualifiedName}\n{t.RelativePath}\n{t.FileCount} file(s) · {Format.Bytes(t.TotalBytes)}")"
+                                 @onclick="() => Toggle(_expandedTables, key)"
+                                 @ondblclick="() => Raise(t, TableActionKind.InsertName)"
+                                 @oncontextmenu="e => OpenMenu(e, t)" @oncontextmenu:preventDefault>
+                                <Icon Name="@(tOpen ? "chevron-down" : "chevron-right")" Class="size-3 shrink-0 text-slate-400" />
+                                <Icon Name="@(t.IsSingleFile ? "file" : t.HivePartitioned ? "layers" : "table")" Class="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                                <span class="truncate">@t.Name</span>
+                                <button class="ml-auto hidden shrink-0 rounded p-0.5 text-slate-400 hover:text-indigo-500 group-hover:block" title="Actions"
+                                        @onclick="e => OpenMenu(e, t)" @onclick:stopPropagation>
+                                    <Icon Name="more" Class="size-3.5" />
+                                </button>
+                            </div>
+                            @if (tOpen)
+                            {
+                                <div class="ml-4 border-l border-slate-200 pl-1.5 dark:border-slate-800">
+                                    <div class="flex flex-wrap gap-x-2 px-2 py-0.5 text-[10.5px] text-slate-400">
+                                        <span>@t.FileCount file@(t.FileCount == 1 ? "" : "s")</span>
+                                        @if (t.TotalBytes is not null) { <span>· @Format.Bytes(t.TotalBytes)</span> }
+                                        @if (t.HivePartitioned) { <span>· partitioned</span> }
+                                    </div>
+                                    @if (t.Error is not null)
+                                    {
+                                        <div class="px-2 py-1 text-xs text-rose-500">@t.Error</div>
+                                    }
+                                    @foreach (var c in t.Columns)
+                                    {
+                                        <div class="flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[12px] hover:bg-slate-100 dark:hover:bg-slate-800/70 @(Dimmed(t, c.Name) ? "opacity-40" : "")"
+                                             title="Double-click to insert" @ondblclick="() => OnInsertText.InvokeAsync(QuoteIfNeeded(c.Name))">
+                                            <Icon Name="@(c.IsPartitionKey ? "key" : Format.TypeIcon(c.Type))" Class="@("size-3 shrink-0 " + (c.IsPartitionKey ? "text-amber-500" : "text-slate-400"))" />
+                                            <span class="truncate">@c.Name</span>
+                                            <span class="ml-auto shrink-0 truncate pl-2 font-mono text-[10.5px] text-slate-400 max-w-28" title="@c.Type">@c.Type.ToLowerInvariant()</span>
+                                        </div>
+                                    }
+                                </div>
+                            }
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+@if (_menuTable is not null)
+{
+    <div class="fixed inset-0 z-40" @onclick="CloseMenu" @oncontextmenu="CloseMenu" @oncontextmenu:preventDefault></div>
+    <div class="menu fixed" style="left:@(_menuX)px; top:@(_menuY)px">
+        <div class="truncate px-3 pt-1.5 pb-1 font-mono text-[11px] text-slate-400">@_menuTable.DisplayQualifiedName</div>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.SelectTop)"><Icon Name="play" Class="size-3.5" /> Select top 1000 rows</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.Count)"><Icon Name="hash" Class="size-3.5" /> Count rows</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.Describe)"><Icon Name="columns" Class="size-3.5" /> Describe columns</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.Summarize)"><Icon Name="sigma" Class="size-3.5" /> Summarize (column stats)</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.Files)"><Icon Name="file" Class="size-3.5" /> Show files &amp; row groups</button>
+        <div class="my-1 h-px bg-slate-200 dark:bg-slate-800"></div>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.ScriptSelect)"><Icon Name="code" Class="size-3.5" /> Script as SELECT</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.InsertName)"><Icon Name="plus" Class="size-3.5" /> Insert name in editor</button>
+        <button class="menu-item" @onclick="() => MenuAction(TableActionKind.CopyName)"><Icon Name="copy" Class="size-3.5" /> Copy name</button>
+    </div>
+}
+
+@code {
+    [Parameter] public EventCallback<TableAction> OnTableAction { get; set; }
+    [Parameter] public EventCallback<string> OnInsertText { get; set; }
+
+    private string _filter = "";
+    private bool _refreshing;
+    private readonly HashSet<string> _collapsedSources = [];
+    private readonly HashSet<string> _expandedTables = [];
+    private TableInfo? _menuTable;
+    private double _menuX, _menuY;
+
+    protected override void OnInitialized() => Catalog.Changed += OnCatalogChanged;
+
+    private void OnCatalogChanged() => InvokeAsync(StateHasChanged);
+
+    private IEnumerable<TableInfo> FilteredTables(SourceInfo src) =>
+        string.IsNullOrWhiteSpace(_filter)
+            ? src.Tables
+            : src.Tables.Where(t => t.Name.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                                 || t.RelativePath.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                                 || t.Columns.Any(c => Matches(c.Name)));
+
+    private bool Matches(string column) =>
+        !string.IsNullOrWhiteSpace(_filter) && column.Contains(_filter, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>While filtering by column name, columns that do not match are dimmed.</summary>
+    private bool Dimmed(TableInfo t, string column) =>
+        !string.IsNullOrWhiteSpace(_filter) && !t.Name.Contains(_filter, StringComparison.OrdinalIgnoreCase) && !Matches(column);
+
+    private static void Toggle(HashSet<string> set, string key)
+    {
+        if (!set.Remove(key)) set.Add(key);
+    }
+
+    private static string QuoteIfNeeded(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, "^[a-z_][a-z0-9_]*$") ? name : SqlText.Ident(name);
+
+    private async Task RefreshAll()
+    {
+        _refreshing = true;
+        try { await Catalog.RefreshAllAsync(); }
+        finally { _refreshing = false; }
+    }
+
+    private Task Refresh(string source) => Catalog.RefreshAsync(source);
+
+    private void OpenMenu(MouseEventArgs e, TableInfo t)
+    {
+        _menuTable = t;
+        _menuX = e.ClientX;
+        _menuY = Math.Max(8, e.ClientY - 8);
+    }
+
+    private void CloseMenu() => _menuTable = null;
+
+    private async Task MenuAction(TableActionKind kind)
+    {
+        var t = _menuTable!;
+        _menuTable = null;
+        await Raise(t, kind);
+    }
+
+    private Task Raise(TableInfo t, TableActionKind kind) => OnTableAction.InvokeAsync(new TableAction(t, kind));
+
+    public void Dispose() => Catalog.Changed -= OnCatalogChanged;
+}

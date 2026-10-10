@@ -1,0 +1,42 @@
+# Example: local folder + MinIO (S3 compatible). Start with: docker compose up --build
+services:
+  parquet-explorer:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./samples:/data:ro            # local folder exposed as source "data"
+      - px-keys:/keys                  # keeps sessions valid across restarts
+    environment:
+      # Users: generate a hash with  docker compose run --rm parquet-explorer hash-password 'MyPassword'
+      ParquetExplorer__Auth__Users__0__Username: admin
+      ParquetExplorer__Auth__Users__0__PasswordHash: "${PX_ADMIN_HASH:?set PX_ADMIN_HASH (see README)}"
+      ParquetExplorer__Auth__Users__0__Roles__0: Admin
+      # Second source: S3 bucket on MinIO
+      ParquetExplorer__DataSources__1__Name: lake
+      ParquetExplorer__DataSources__1__Type: S3
+      ParquetExplorer__DataSources__1__Bucket: lake
+      ParquetExplorer__DataSources__1__Endpoint: minio:9000
+      ParquetExplorer__DataSources__1__UrlStyle: path
+      ParquetExplorer__DataSources__1__UseSsl: "false"
+      ParquetExplorer__DataSources__1__Region: us-east-1
+      ParquetExplorer__DataSources__1__AccessKeyId: minioadmin
+      ParquetExplorer__DataSources__1__SecretAccessKey: minioadmin
+    depends_on:
+      - minio
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+volumes:
+  px-keys:
+  minio-data:
